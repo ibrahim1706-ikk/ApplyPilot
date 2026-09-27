@@ -14,6 +14,7 @@ import * as db from "~/db";
 import { currentUser, endSession, startSession } from "~/server/auth";
 import { fetchPostingText, normalisePostingUrl } from "~/server/fetch-posting";
 import { generateKit, readPostingHints } from "~/server/generate";
+import { ensureFacts } from "~/server/qualifications";
 import { emailStatus, sendPasswordResetEmail } from "~/server/email";
 import { checkAndRecord, emailBucket, ipBucket, userBucket } from "~/server/ratelimit";
 import type { RuleName } from "~/server/ratelimit";
@@ -23,7 +24,14 @@ import {
   sniffUpload,
 } from "~/server/extract";
 import { HUMAN_MAX_SIZE } from "~/types";
-import type { ApplicationSummary, Kit, MaterialSummary, ProfileFormValues } from "~/types";
+import type {
+  ApplicationSummary,
+  ExtractionReport,
+  Fact,
+  Kit,
+  MaterialSummary,
+  ProfileFormValues,
+} from "~/types";
 
 type Result<T = object> = ({ ok: true } & T) | { ok: false; error: string };
 
@@ -487,6 +495,41 @@ export const loadProfile = createServerFn({ method: "POST" }).handler(
     const user = currentUser();
     if (!user) return { ok: false, error: NOT_SIGNED_IN };
     return { ok: true, profile: toFormValues(db.getProfile(user.id)) };
+  }
+);
+/**
+ * The qualifications facts for the signed-in account — read-only.
+ *
+ * Deterministic and offline: the facts module reads the user's own résumé text
+ * and vault fields, so no model is called and nothing can be invented. It
+ * re-reads the material whenever it has changed since the stored pass, which is
+ * what makes the page show what the current résumé says rather than an old
+ * version of it. Reading is enough to (re)build the facts; there is no path
+ * here that edits or confirms one — that is a later piece of work.
+ */
+export const loadQualifications = createServerFn({ method: "POST" }).handler(
+  async (): Promise<
+    Result<{ facts: Fact[]; report: ExtractionReport; computedAt: string; recomputed: boolean }>
+  > => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    try {
+      const state = ensureFacts(user.id);
+      return {
+        ok: true,
+        facts: state.facts,
+        report: state.report,
+        computedAt: state.computedAt,
+        recomputed: state.recomputed,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error:
+          "We couldn't read your material just now. Nothing has been changed — try again in a moment." +
+          (error instanceof Error ? ` (${error.message})` : ""),
+      };
+    }
   }
 );
 

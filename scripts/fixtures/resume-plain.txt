@@ -1,0 +1,42 @@
+ALEX MORGAN
+alex.morgan@example.com | 0412 345 678 | Melbourne, Australia
+github.com/alexmorgan | linkedin.com/in/alexmorgan | alexmorgan.dev
+
+SUMMARY
+Product analyst who turns messy support data into decisions. Six years across
+fintech and health SaaS, comfortable in SQL and Python, and used to talking to
+engineers, designers and the customer support floor in the same afternoon.
+
+EXPERIENCE
+Senior Product Analyst, Northwind Financial — Feb 2022 – Present
+ Built the weekly retention dashboard the exec team now runs Monday standups from.
+ Grew activation from 41% to 63% over three quarters by rewriting the onboarding checklist.
+ Ran 12 pricing experiments per quarter and cut the time to an answer from 9 days to 2.
+ Managed a $240k analytics tooling budget and consolidated four vendors into one.
+Product Analyst, Northwind Financial — Mar 2020 – Feb 2022
+ Owned the support-deflection model, which reduced inbound tickets 18%.
+ Partnered with two engineers to ship a self-serve refund flow.
+Junior Data Analyst
+Harbour Health Group | Jul 2018 – Mar 2020
+ Wrote the SQL behind the monthly patient wait-time report.
+ Trained 14 clinic coordinators on the new reporting portal.
+
+EDUCATION
+Bachelor of Commerce (Business Analytics), University of Melbourne, 2015 – 2018
+ WAM 79.4, Dean's List 2017
+
+SKILLS
+SQL (advanced), Python, dbt, Looker, Figma, A/B testing, dbt Cloud, Snowflake
+Programming: Python, R
+Tools: Metabase, Jira, Notion
+
+CERTIFICATIONS
+Google Analytics Certification, 2021
+AWS Certified Cloud Practitioner
+2023
+
+LANGUAGES
+English (native), Spanish (B2), Mandarin (conversational)
+
+WORK RIGHTS
+Australian citizen. No sponsorship required for any role in Australia.

@@ -383,6 +383,25 @@ export function normalisedFactText(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+/**
+ * Human description of where a fact came from, shown under its quote. Lives here
+ * (not in the extractor) because the client needs it and the extractor is
+ * server-only.
+ */
+export function factSourceLabel(source: FactSource): string {
+  if (source.kind === "profile") return `From your vault — ${source.label}`;
+  if (source.kind === "resume") return `From your résumé text, line ${source.line}`;
+  return "Added by you";
+}
+
+/** Facts grouped in display order, for the read-only screen. */
+export function groupFacts(facts: Fact[]): Array<{ category: FactCategory; facts: Fact[] }> {
+  return FACT_CATEGORY_ORDER.map((category) => ({
+    category,
+    facts: facts.filter((fact) => fact.category === category),
+  }));
+}
+
 /** Labels offered for an uploaded material. The first one fills the résumé text. */
 export const MATERIAL_LABELS = [
   "Résumé",

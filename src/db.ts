@@ -268,6 +268,24 @@ CREATE TABLE IF NOT EXISTS rate_events (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS rate_events_idx ON rate_events(scope, bucket, created_at);
+-- The extracted qualifications facts: what we read out of the user's own
+-- résumé text and vault fields, with the quote each fact came from. One row per
+-- account — the fact set is small (tens of rows of JSON) and it is always
+-- replaced as a whole, so a single row is both simpler and safer than a table
+-- of facts that could drift out of step with the input it was read from.
+--
+-- The input_hash column fingerprints the material the facts were read from. When the
+-- user edits their résumé text or their vault fields the fingerprint changes,
+-- and the next read re-runs the extractor instead of showing stale facts.
+-- Plain TEXT/DELETE-then-INSERT only, so this table carries over to Postgres
+-- unchanged when the store is swapped for a managed database.
+CREATE TABLE IF NOT EXISTS qualifications (
+  user_id      TEXT PRIMARY KEY,
+  facts_json   TEXT NOT NULL DEFAULT '[]',
+  report_json  TEXT NOT NULL DEFAULT '{}',
+  input_hash   TEXT NOT NULL DEFAULT '',
+  computed_at  TEXT NOT NULL
+);
 `;
 
 // ---------------------------------------------------------------- connection ---
@@ -769,6 +787,45 @@ export function pruneRateEvents(beforeIso: string): void {
   run("DELETE FROM rate_events WHERE created_at < ?", [beforeIso]);
 }
 
+// ------------------------------------------------- qualifications facts ---
+/**
+ * One stored extraction for an account. The JSON columns are opaque here: the
+ * storage module keeps whatever the qualifications module wrote and hands it
+ * back, so the fact shape stays defined in one place (`src/types.ts`).
+ */
+export type StoredQualifications = {
+  user_id: string;
+  facts_json: string;
+  report_json: string;
+  input_hash: string;
+  computed_at: string;
+};
+export function getQualifications(userId: string): StoredQualifications | null {
+  return one<StoredQualifications>(
+    "SELECT user_id, facts_json, report_json, input_hash, computed_at FROM qualifications WHERE user_id = ?",
+    [userId]
+  );
+}
+/**
+ * Replaces the stored extraction. DELETE-then-INSERT rather than an upsert
+ * because `INSERT OR REPLACE`/`ON CONFLICT` are engine-specific and this module
+ * has to move to a managed Postgres unchanged. A crash between the two
+ * statements leaves no row, which the reader treats as "recompute me" — the safe
+ * failure, not a stale one.
+ */
+export function saveQualifications(
+  userId: string,
+  input: { factsJson: string; reportJson: string; inputHash: string; computedAt: string }
+): void {
+  run("DELETE FROM qualifications WHERE user_id = ?", [userId]);
+  run(
+    "INSERT INTO qualifications (user_id, facts_json, report_json, input_hash, computed_at) VALUES (?, ?, ?, ?, ?)",
+    [userId, input.factsJson, input.reportJson, input.inputHash, input.computedAt]
+  );
+}
+export function deleteQualifications(userId: string): void {
+  run("DELETE FROM qualifications WHERE user_id = ?", [userId]);
+}
 // --------------------------------------------------------- deleting an account ---
 //
 // One function, one transaction, every table that holds anything about the
@@ -784,6 +841,8 @@ export type DeletedAccount = {
   sessions: number;
   resets: number;
   rateEvents: number;
+  /** The stored qualifications fact set for this account, if it had one. */
+  qualifications: number;
   /** Stored paths of the user's uploaded originals, relative to `uploadsRoot()`/userId. */
   materialPaths: string[];
 };
@@ -805,6 +864,7 @@ export function deleteAccount(userId: string): DeletedAccount | null {
     materials: counts("SELECT COUNT(*) AS n FROM materials WHERE user_id = ?"),
     sessions: counts("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?"),
     resets: counts("SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?"),
+    qualifications: counts("SELECT COUNT(*) AS n FROM qualifications WHERE user_id = ?"),
     rateEvents: 0,
     materialPaths: materials.map((m) => m.stored_path),
   };
@@ -815,6 +875,7 @@ export function deleteAccount(userId: string): DeletedAccount | null {
     run("DELETE FROM profiles WHERE user_id = ?", [userId]);
     run("DELETE FROM sessions WHERE user_id = ?", [userId]);
     run("DELETE FROM password_resets WHERE user_id = ?", [userId]);
+    run("DELETE FROM qualifications WHERE user_id = ?", [userId]);
     run("DELETE FROM users WHERE id = ?", [userId]);
   })();
 
@@ -832,6 +893,7 @@ export function countRowsForUser(userId: string): Record<string, number> {
     materials: count("SELECT COUNT(*) AS n FROM materials WHERE user_id = ?", [userId]),
     sessions: count("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?", [userId]),
     password_resets: count("SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?", [userId]),
+    qualifications: count("SELECT COUNT(*) AS n FROM qualifications WHERE user_id = ?", [userId]),
   };
 }
 
@@ -860,6 +922,12 @@ export type AccountExport = {
     createdAt: string;
     updatedAt: string;
   }>;
+  /** The qualifications facts read from this account's own material. */
+  qualifications: {
+    facts: unknown;
+    report: unknown;
+    computedAt: string;
+  } | null;
 };
 
 /**
@@ -892,6 +960,17 @@ export function exportAccount(userId: string): AccountExport | null {
       createdAt: application.created_at,
       updatedAt: application.updated_at,
     })),
+    qualifications: readQualificationsForExport(userId),
+  };
+}
+/** The stored fact set, as plain data, for the account export. */
+function readQualificationsForExport(userId: string): AccountExport["qualifications"] {
+  const stored = getQualifications(userId);
+  if (!stored) return null;
+  return {
+    facts: parseUnknownJson(stored.facts_json),
+    report: parseUnknownJson(stored.report_json),
+    computedAt: stored.computed_at,
   };
 }
 
@@ -908,7 +987,15 @@ function parseUnknownJson(raw: string | null): unknown {
 
 /** Total rows in the tables a restore has to reproduce. */
 export function tableCounts(): Record<string, number> {
-  const names = ["users", "sessions", "profiles", "applications", "materials", "password_resets"];
+  const names = [
+    "users",
+    "sessions",
+    "profiles",
+    "applications",
+    "materials",
+    "password_resets",
+    "qualifications",
+  ];
   const out: Record<string, number> = {};
   for (const name of names) {
     // `name` comes from this fixed list, never from input.
