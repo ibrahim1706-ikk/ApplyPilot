@@ -150,7 +150,6 @@ for (const fact of [...pdfFacts, ...plainFacts, ...thinFacts]) {
 }
 
 // Nothing may appear in the thin résumé's facts that is not in its text.
-const thinTruth = thinText.toLowerCase();
 const thinInput = baseInput(thinText);
 const thinFactsForbiddenChecks: Array<[string, (fact: Fact) => boolean]> = [
   ["a skill", (fact) => fact.category === "skill"],
