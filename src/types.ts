@@ -325,6 +325,22 @@ export type Fact = {
   origin: FactOrigin;
   /** True once the user has changed any part of it. */
   edited: boolean;
+  /**
+   * True when the exact line this fact was read from is no longer in the user's
+   * material, but their own corrected version is kept and shown. Never set by the
+   * extractor — only when a decision outlives the line it was made about.
+   */
+  sourceGone?: boolean;
+  /** When the user kept, corrected or added this fact (their own timestamp). */
+  decidedAt?: string;
+  /** A note the user attached to a fact they added themselves. */
+  userNote?: string;
+  /**
+   * The fact exactly as it read when the user's decision was taken, so their
+   * version can still be shown — and the original quote still cited — after the
+   * material behind it changes.
+   */
+  originalValue?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -401,6 +417,115 @@ export function groupFacts(facts: Fact[]): Array<{ category: FactCategory; facts
     facts: facts.filter((fact) => fact.category === category),
   }));
 }
+
+// ------------------------------------------------------- the user's decisions ---
+//
+// Stage 2: the fact set becomes the user's own. What the extractor reads is only
+// a suggestion; what the user keeps, corrects or adds is the record. Decisions
+// are stored separately from the extracted facts, keyed by fact id, so a résumé
+// change re-reads the material without throwing away anything the user decided.
+//
+// Nothing here is ever inferred: a decision is only ever something the user did.
+
+export type FactDecisionAction = "keep" | "correct" | "exclude" | "add";
+
+/** The fact exactly as it read when the user acted on it. */
+export type FactSnapshot = {
+  label: string;
+  value: string;
+  quote: string;
+  note: string;
+  source: FactSource;
+};
+
+export type FactDecision = {
+  /** The fact this decision is about (its own id for a fact the user added). */
+  id: string;
+  category: FactCategory;
+  action: FactDecisionAction;
+  /** The user's own values — present for "correct" and "add", kept if later excluded. */
+  fields?: Record<string, string>;
+  /** Display text of the user's version, kept in step with `fields`. */
+  value?: string;
+  /** Optional note the user typed for a fact they added. */
+  userNote?: string;
+  /** How the fact read when the decision was taken (absent for "add"). */
+  snapshot?: FactSnapshot;
+  /**
+   * `category|normalised value` of the fact as extracted. An exclusion sticks to
+   * this rather than to a line number, so re-uploading the same résumé (whose
+   * lines have moved) does not quietly bring back something the user removed.
+   */
+  valueKey: string;
+  at: string;
+};
+
+/** `category|normalised value` — how a decision finds the fact it was made about. */
+export function factValueKey(category: FactCategory, value: string): string {
+  return `${category}|${normalisedFactText(value)}`;
+}
+
+/**
+ * When the user confirmed a set as a whole, and a fingerprint of the set they
+ * confirmed. If the set has changed since, the fingerprint no longer matches and
+ * the confirmation reads as stale — the user is told, rather than the app
+ * pretending an edited set was the one they signed off.
+ */
+export type FactConfirmation = { at: string; setHash: string };
+
+export type FactConfirmations = {
+  overall: FactConfirmation | null;
+  categories: Record<FactCategory, FactConfirmation | null>;
+};
+
+export function emptyFactConfirmations(): FactConfirmations {
+  return {
+    overall: null,
+    categories: Object.fromEntries(
+      FACT_CATEGORY_ORDER.map((category) => [category, null])
+    ) as Record<FactCategory, FactConfirmation | null>,
+  };
+}
+
+/** What stage 3 gates on: has the user confirmed the facts as they now stand? */
+export type ConfirmationStatus = "confirmed" | "changed" | "pending";
+
+export function confirmationStatus(
+  confirmations: FactConfirmations,
+  scope: "overall" | FactCategory,
+  currentHash: string
+): ConfirmationStatus {
+  const entry = scope === "overall" ? confirmations.overall : confirmations.categories[scope];
+  if (!entry) return "pending";
+  return entry.setHash === currentHash ? "confirmed" : "changed";
+}
+
+/** Short label for a fact's provenance and decision, for the review list. */
+export type FactBadge =
+  | "not-confirmed"
+  | "kept"
+  | "edited"
+  | "excluded"
+  | "you-added"
+  | "line-gone";
+
+export function factBadge(fact: Fact): FactBadge {
+  if (fact.origin === "user") return "you-added";
+  if (fact.status === "excluded") return "excluded";
+  if (fact.sourceGone) return "line-gone";
+  if (fact.edited) return "edited";
+  if (fact.status === "confirmed") return "kept";
+  return "not-confirmed";
+}
+
+export const FACT_BADGE_COPY: Record<FactBadge, { label: string; className: string }> = {
+  "not-confirmed": { label: "not confirmed yet", className: "bg-slate-100 text-slate-600" },
+  kept: { label: "kept by you", className: "bg-emerald-100 text-emerald-800" },
+  edited: { label: "edited by you", className: "bg-amber-100 text-amber-900" },
+  excluded: { label: "excluded by you", className: "bg-slate-200 text-slate-600" },
+  "you-added": { label: "you added this", className: "bg-indigo-100 text-indigo-800" },
+  "line-gone": { label: "your version — source line changed", className: "bg-amber-100 text-amber-900" },
+};
 
 /** Labels offered for an uploaded material. The first one fills the résumé text. */
 export const MATERIAL_LABELS = [
