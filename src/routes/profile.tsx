@@ -153,6 +153,17 @@ function ProfileForm({
       </Card>
 
       <MaterialsCard initial={initialMaterials} onExtractedResume={handleExtractedResume} />
+      <Card>
+        <SectionTitle hint="A read-only list of what we can find in your résumé text and the fields above, next to the exact line each fact came from.">
+          What we found in your material
+        </SectionTitle>
+        <Link
+          to="/qualifications"
+          className="inline-flex items-center rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+        >
+          See what we read
+        </Link>
+      </Card>
 
       <Card id="resume">
         <SectionTitle hint="Upload a file above and the text lands here, or paste it straight in. Either way it's yours to edit — the kit quotes your own wording rather than paraphrasing it into something you didn't write.">
