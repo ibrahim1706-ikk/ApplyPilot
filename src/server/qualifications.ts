@@ -898,6 +898,23 @@ function identityDrafts(input: QualificationInput, doc: ParsedDocument): FactDra
   field("Portfolio", "portfolio_url", input.portfolioUrl);
   field("GitHub", "github_url", input.githubUrl);
   field("LinkedIn", "linkedin_url", input.linkedinUrl);
+  // Notice period and salary expectation are vault answers to questions a real
+  // application form asks. They come through this pipeline like everything else
+  // so the user can check, correct and CONFIRM them — stage 3 will only ever
+  // answer a form from confirmed facts, and these are two of the fields it
+  // answers. Whatever the user typed is quoted as it stands; nothing is added.
+  field(
+    "Notice period",
+    "notice_period",
+    input.noticePeriod,
+    "Saved in the vault's Application basics card, in your own words. We never assume a notice period from a role's dates."
+  );
+  field(
+    "Salary expectation",
+    "salary_expectation",
+    input.salaryExpectation,
+    "Saved in the vault's Application basics card, in your own words. No range or market rate is ever suggested here."
+  );
 
   const have = (label: string): boolean => out.some((item) => item.label === label);
 
@@ -1725,8 +1742,12 @@ export function extractFacts(input: QualificationInput): {
  * v2: the user's own decisions (kept / corrected / excluded / added) live beside
  * the extracted facts, so an extractor change re-reads the facts and re-applies
  * those decisions instead of reusing a stored set.
+ *
+ * v3: the vault's notice period and salary expectation are read as facts too, so
+ * the field-answering layer (stage 3) can quote them the way it quotes
+ * everything else — and so the user can confirm or correct them.
  */
-export const FACTS_VERSION = 2;
+export const FACTS_VERSION = 3;
 
 /** A stable fingerprint of exactly the inputs the extractor reads. */
 export function inputFingerprint(input: QualificationInput): string {
@@ -1744,6 +1765,9 @@ export function inputFingerprint(input: QualificationInput): string {
     input.experience,
     input.workAuthorisation,
     input.workAuthorisationNote,
+    // Read by the extractor as of v3, so a change to either must re-read.
+    input.noticePeriod,
+    input.salaryExpectation,
   ]);
   return createHash("sha256").update(payload).digest("hex").slice(0, 32);
 }
