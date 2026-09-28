@@ -87,7 +87,8 @@ process.env.APPLYPILOT_DATA_DIR = dataDir;
 
 const db = await import("../src/db");
 const q = await import("../src/server/qualifications");
-const { FACT_CATEGORY_COPY, FACT_CATEGORY_ORDER, factValueKey } = await import("../src/types");
+const { FACT_BADGE_COPY, FACT_CATEGORY_COPY, FACT_CATEGORY_ORDER, factBadge, factSourceCaption, factValueKey } =
+  await import("../src/types");
 type Fact = import("../src/types").Fact;
 type FactDecision = import("../src/types").FactDecision;
 
@@ -392,6 +393,22 @@ if (!keepMe || !fixMe || !dropMe || !secondSkill) {
   const addOutcome = q.addFact(user.id, "language", { value: "German", level: "A2" }, "Night school, 2023.");
   check("add saves", addOutcome.ok && typeof addOutcome.id === "string");
 
+  // The same fact, added a second time (a second press of "Add it"). It must not
+  // become a second row: the user added one fact, so the list holds one.
+  const addAgain = q.addFact(user.id, "language", { value: "German", level: "B2" }, "A second press.");
+  const afterAddAgain = q.ensureFacts(user.id);
+  check(
+    "adding the same fact twice is refused, and leaves one row, not two",
+    !addAgain.ok &&
+      /already in your list/.test(addAgain.error) &&
+      afterAddAgain.facts.filter((fact) => fact.origin === "user" && fact.value === "German").length === 1,
+    JSON.stringify({
+      ok: addAgain.ok,
+      error: addAgain.ok ? null : addAgain.error,
+      rows: afterAddAgain.facts.filter((fact) => fact.origin === "user").map((fact) => fact.id),
+    })
+  );
+
   const afterDecisions = q.ensureFacts(user.id);
   const kept = afterDecisions.facts.find((fact) => fact.id === keepMe.id);
   const fixed = afterDecisions.facts.find((fact) => fact.id === fixMe.id);
@@ -562,6 +579,219 @@ if (!keepMe || !fixMe || !dropMe || !secondSkill) {
     "no rows are left behind in the decisions table",
     (tables.qualification_decisions ?? 0) === 0,
     JSON.stringify(tables)
+  );
+}
+
+// ------------------------------- D. the carry-over's own wording and listing ---
+//
+// Four defects found by reading the screen in a browser after a résumé change,
+// each one a case of the app saying something about the user that was not true.
+// The fixture below is the browser's own case: a SKILLS line "Figma, SQL, Python"
+// on line 10 that becomes "Figma, Python" on line 10, and a CERTIFICATIONS
+// section that is deleted outright.
+
+banner("D. what the carry-over lists and says (the four defects, checked here)");
+
+const V1 = [
+  "ALEX CARRYOVER",
+  "CARRYOVER-FIX marker line",
+  "EMAIL carryover-fix@example.com",
+  "EXPERIENCE",
+  "Support Analyst, Northwind - Mar 2021 - Present",
+  "Handled the review queue.",
+  "EDUCATION",
+  "BSc Information Systems, Deakin University, 2020",
+  "SKILLS",
+  "Figma, SQL, Python",
+  "CERTIFICATIONS",
+  "ITIL Foundation, 2021",
+].join("\n");
+const V2 = [
+  "ALEX CARRYOVER",
+  "RESUME-V2 marker line",
+  "EMAIL carryover-fix@example.com",
+  "EXPERIENCE",
+  "Support Analyst, Northwind - Mar 2021 - Present",
+  "Handled the review queue.",
+  "EDUCATION",
+  "BSc Information Systems, Deakin University, 2020",
+  "SKILLS",
+  "Figma, Python",
+].join("\n");
+
+const v1Facts = extract(V1).facts;
+const v2Facts = extract(V2).facts;
+const figma = v1Facts.find((fact) => fact.category === "skill" && /^figma$/i.test(fact.value));
+const sql = v1Facts.find((fact) => fact.category === "skill" && /^sql$/i.test(fact.value));
+const python = v1Facts.find((fact) => fact.category === "skill" && /^python$/i.test(fact.value));
+const certV1 = v1Facts.find((fact) => fact.category === "certification");
+
+check(
+  "the fixture reproduces the browser case: Figma/SQL/Python on line 10, and a certification",
+  figma?.source.kind === "resume" &&
+    figma.source.line === 10 &&
+    sql?.source.kind === "resume" &&
+    sql.source.line === 10 &&
+    python?.source.kind === "resume" &&
+    python.source.line === 10 &&
+    Boolean(certV1),
+  JSON.stringify({ figma: figma?.source, cert: certV1?.value })
+);
+
+if (figma && sql && python && certV1) {
+  const correctedSql = decide(sql, "correct", {
+    fields: { value: "SQL (advanced) - my own wording CARRYOVER-FIX" },
+    value: "SQL (advanced) - my own wording CARRYOVER-FIX",
+  });
+  const keepFigma = decide(figma, "keep");
+  const keepCert = decide(certV1, "keep");
+  const excludePython = decide(python, "exclude");
+  const addGermanOnce: FactDecision = {
+    id: "user-language-carryover-a",
+    category: "language",
+    action: "add",
+    fields: { value: "German", level: "B2" },
+    value: "German",
+    userNote: "added by me in the browser CARRYOVER-FIX",
+    valueKey: factValueKey("language", "German"),
+    at: "2026-02-01T10:00:00.000Z",
+  };
+  // The same fact, added a second time — a second press of "Add it" — which is
+  // what the browser account had stored, 38 seconds apart.
+  const addGermanTwice: FactDecision = {
+    ...addGermanOnce,
+    id: "user-language-carryover-b",
+    at: "2026-02-01T10:00:38.000Z",
+  };
+  const decisions = [keepFigma, correctedSql, keepCert, excludePython, addGermanOnce, addGermanTwice];
+
+  const run = applied(v2Facts, decisions);
+
+  // ---- 1. a fact the user added once is listed once -------------------------
+  const germanRows = run.facts.filter((fact) => fact.origin === "user" && fact.value === "German");
+  check(
+    "an added fact stored twice by a second press is listed once, not as two identical rows",
+    germanRows.length === 1,
+    `listed ${String(germanRows.length)} times: ${JSON.stringify(germanRows.map((fact) => fact.id))}`
+  );
+  check(
+    "…and it is the row from when they first added it",
+    germanRows[0]?.id === addGermanOnce.id && germanRows[0]?.decidedAt === addGermanOnce.at,
+    JSON.stringify({ id: germanRows[0]?.id, at: germanRows[0]?.decidedAt })
+  );
+  check(
+    "…and the user is told the duplicate was folded in rather than it happening silently",
+    run.notes.some((note) => /added .*more than once/i.test(note) && /listed once/i.test(note)),
+    JSON.stringify(run.notes)
+  );
+
+  // ---- 2. a line whose CONTENT changed is not described as a moved line -----
+  const figmaNote = run.notes.find((note) => note.includes("Figma"));
+  check(
+    "a fact whose line number did not change is NOT said to have moved line",
+    Boolean(figmaNote) && !/different line/i.test(figmaNote ?? ""),
+    JSON.stringify(figmaNote)
+  );
+  check(
+    "…it says the wording on that line changed, and which line it is",
+    Boolean(figmaNote) && /still line 10/i.test(figmaNote ?? "") && /wording on that line has changed/i.test(figmaNote ?? ""),
+    JSON.stringify(figmaNote)
+  );
+  const figmaRowV2 = run.facts.find((fact) => fact.category === "skill" && fact.value === "Figma");
+  check(
+    "…and the decision still applies, on the line that now carries it",
+    figmaRowV2?.status === "confirmed" && figmaRowV2.source.kind === "resume" && figmaRowV2.source.line === 10,
+    JSON.stringify({ status: figmaRowV2?.status, source: figmaRowV2?.source })
+  );
+
+  // A line that really did move is still reported as a move, with both numbers.
+  const shiftedV1 = `A LINE THE USER ADDED ABOVE EVERYTHING ELSE\n${V1}`;
+  const movedRun = applied(extract(shiftedV1).facts, [keepFigma]);
+  const movedNote = movedRun.notes.find((note) => note.includes("Figma"));
+  check(
+    "a fact whose line really did move is still reported as a move, with both line numbers",
+    Boolean(movedNote) && /different line/i.test(movedNote ?? "") && /line 11 now, line 10 then/.test(movedNote ?? ""),
+    JSON.stringify(movedNote)
+  );
+
+  // ---- 3. a fact whose source line is gone is captioned in the past tense ---
+  const sqlRow = run.facts.find((fact) => fact.category === "skill" && fact.value === correctedSql.value);
+  const sqlCaption = sqlRow ? factSourceCaption(sqlRow) : "";
+  check(
+    "a corrected fact whose line is gone keeps the user's wording and is marked as no longer sourced",
+    sqlRow?.status === "confirmed" && sqlRow.edited === true && sqlRow.sourceGone === true,
+    JSON.stringify({ status: sqlRow?.status, edited: sqlRow?.edited, sourceGone: sqlRow?.sourceGone })
+  );
+  check(
+    "…and its caption reads as a PAST reading, not a current location",
+    /^Was read from your résumé text, line 10/.test(sqlCaption) && /when we read your material/.test(sqlCaption),
+    JSON.stringify(sqlCaption)
+  );
+  check(
+    "…and it never opens by asserting where the fact is read from now",
+    !/^From your résumé text, line 10/.test(sqlCaption),
+    JSON.stringify(sqlCaption)
+  );
+  const liveCaption = figmaRowV2 ? factSourceCaption(figmaRowV2) : "";
+  check(
+    "a fact whose line is still in the material keeps its present-tense caption, unchanged",
+    liveCaption === "From your résumé text, line 10 · read in your “skills” section · edited by you after we read it" ||
+      liveCaption === "From your résumé text, line 10 · read in your “skills” section",
+    JSON.stringify(liveCaption)
+  );
+
+  // ---- 4. a fact the user KEPT is never shown as one they excluded ----------
+  const certRow = run.facts.find((fact) => fact.category === "certification");
+  check(
+    "a kept fact whose line is gone is still listed as kept, with the value they said was right",
+    certRow?.status === "confirmed" && certRow.value === certV1.value && certRow.sourceGone === true,
+    JSON.stringify({ status: certRow?.status, value: certRow?.value, sourceGone: certRow?.sourceGone })
+  );
+  check(
+    "…and it is not counted as excluded, so it cannot appear struck through or in the excluded list",
+    run.facts.filter((fact) => fact.status === "excluded").every((fact) => fact.category !== "certification"),
+    JSON.stringify(run.facts.filter((fact) => fact.status === "excluded").map((fact) => fact.category))
+  );
+  const certBadge = certRow ? factBadge(certRow) : null;
+  check(
+    "…and its badge says the user kept it and the line is gone — never \"excluded by you\"",
+    certBadge === "kept-line-gone" &&
+      /kept by you/i.test(FACT_BADGE_COPY["kept-line-gone"].label) &&
+      !/excluded/i.test(FACT_BADGE_COPY["kept-line-gone"].label),
+    JSON.stringify({ badge: certBadge, copy: certBadge ? FACT_BADGE_COPY[certBadge].label : null })
+  );
+  const certCaption = certRow ? factSourceCaption(certRow) : "";
+  check(
+    "…and its caption is a past reading too",
+    /^Was read from your résumé text, line 12/.test(certCaption) && /when we read your material/.test(certCaption),
+    JSON.stringify(certCaption)
+  );
+
+  // An exclusion is still an exclusion when its line goes: nothing is resurrected,
+  // and nothing the user removed is quietly read as kept.
+  const excludedCertRun = applied(v2Facts, [decide(certV1, "exclude")]);
+  const stillExcluded = excludedCertRun.facts.find((fact) => fact.category === "certification");
+  check(
+    "an excluded fact whose line is gone stays excluded, listed so it can be brought back",
+    stillExcluded?.status === "excluded" && stillExcluded.sourceGone === true,
+    JSON.stringify({ status: stillExcluded?.status, sourceGone: stillExcluded?.sourceGone })
+  );
+  check(
+    "…and Python, excluded while its line survived, is still excluded",
+    run.facts.find((fact) => fact.category === "skill" && fact.value === "Python")?.status === "excluded",
+    JSON.stringify(run.facts.find((fact) => fact.category === "skill" && fact.value === "Python")?.status)
+  );
+
+  // Nothing in all of this invents a fact, and every extracted row still quotes
+  // its own material.
+  const v2Values = new Set(v2Facts.map((fact) => fact.value));
+  const inventedInCarryOver = run.facts.filter(
+    (fact) => fact.origin !== "user" && !v2Values.has(fact.originalValue ?? fact.value)
+  );
+  check(
+    "the carry-over still invents nothing: every extracted row traces to the material or to a decision the user made",
+    inventedInCarryOver.every((fact) => decisions.some((decision) => decision.id === fact.id)),
+    JSON.stringify(inventedInCarryOver.map((fact) => fact.value))
   );
 }
 

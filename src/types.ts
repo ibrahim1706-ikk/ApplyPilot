@@ -410,6 +410,41 @@ export function factSourceLabel(source: FactSource): string {
   return "Added by you";
 }
 
+/**
+ * The caption under a fact's quoted line.
+ *
+ * While the fact still traces to something the material has, this says where it
+ * is read from, in the present tense. Once the exact line is gone
+ * (`sourceGone` — a decision that outlived the line behind it) it reads as a PAST
+ * reading instead, because the stored line is what the material said when we read
+ * it, not where the fact sits now: saying "from line 10" about a line 10 that has
+ * since changed would assert a location the material no longer supports.
+ */
+export function factSourceCaption(fact: Fact): string {
+  const section =
+    fact.source.kind === "resume" && fact.source.section !== "other"
+      ? `read in your “${fact.source.section}” section`
+      : null;
+  if (fact.sourceGone) {
+    const was =
+      fact.source.kind === "resume"
+        ? `Was read from your résumé text, line ${fact.source.line}`
+        : fact.source.kind === "profile"
+          ? `Was read from your vault — ${fact.source.label}`
+          : "Was added by you";
+    return [
+      was,
+      section ? `${section} when we read your material` : "when we read your material",
+      fact.edited ? "edited by you after we read it" : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(" · ");
+  }
+  return [factSourceLabel(fact.source), section, fact.edited ? "edited by you after we read it" : null]
+    .filter((part): part is string => part !== null)
+    .join(" · ");
+}
+
 /** Facts grouped in display order, for the read-only screen. */
 export function groupFacts(facts: Fact[]): Array<{ category: FactCategory; facts: Fact[] }> {
   return FACT_CATEGORY_ORDER.map((category) => ({
@@ -507,12 +542,16 @@ export type FactBadge =
   | "edited"
   | "excluded"
   | "you-added"
-  | "line-gone";
+  | "line-gone"
+  | "kept-line-gone";
 
 export function factBadge(fact: Fact): FactBadge {
   if (fact.origin === "user") return "you-added";
   if (fact.status === "excluded") return "excluded";
-  if (fact.sourceGone) return "line-gone";
+  // The line behind a decision can go without the decision going with it. What
+  // the user decided is stated first ("kept by you", "your version"), because
+  // that is still true; the gone line is what is added.
+  if (fact.sourceGone) return fact.edited ? "line-gone" : "kept-line-gone";
   if (fact.edited) return "edited";
   if (fact.status === "confirmed") return "kept";
   return "not-confirmed";
@@ -524,7 +563,8 @@ export const FACT_BADGE_COPY: Record<FactBadge, { label: string; className: stri
   edited: { label: "edited by you", className: "bg-amber-100 text-amber-900" },
   excluded: { label: "excluded by you", className: "bg-slate-200 text-slate-600" },
   "you-added": { label: "you added this", className: "bg-indigo-100 text-indigo-800" },
-  "line-gone": { label: "your version — source line changed", className: "bg-amber-100 text-amber-900" },
+  "line-gone": { label: "your version — line no longer in your material", className: "bg-amber-100 text-amber-900" },
+  "kept-line-gone": { label: "kept by you — line no longer in your material", className: "bg-amber-100 text-amber-900" },
 };
 
 /** Labels offered for an uploaded material. The first one fills the résumé text. */

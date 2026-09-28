@@ -1981,15 +1981,22 @@ function addedFact(decision: FactDecision): Fact {
 
 /**
  * A fact whose source line is no longer in the material, but which the user had
- * decided about. Their version is kept — corrected facts stay visible with the
- * original quote beside them and the change stated — because a résumé edit must
- * never quietly delete something the user typed.
+ * decided about. Their decision is kept — corrected facts stay visible with the
+ * original quote beside them and the change stated, and facts they KEPT stay
+ * kept — because a résumé edit must never quietly delete something the user
+ * decided, and must never record a decision they did not make.
  */
 function revivedFact(decision: FactDecision): Fact | null {
   if (!decision.snapshot) return null;
   const fields = decision.fields ?? {};
   const userValue = decision.value ?? deriveFactValue(decision.category, fields, "");
   const corrected = decision.action === "correct";
+  // A fact the user KEPT stands on their own decision, so the line behind it
+  // going away cannot turn it into something they excluded — that would be the
+  // app putting a decision in their mouth. It comes back confirmed and is marked
+  // as no longer tracing to a line, exactly as a correction is. Only an
+  // exclusion comes back excluded.
+  const stands = corrected || decision.action === "keep";
   return {
     id: decision.id,
     category: decision.category,
@@ -1999,7 +2006,7 @@ function revivedFact(decision: FactDecision): Fact | null {
     source: decision.snapshot.source,
     quote: decision.snapshot.quote,
     note: decision.snapshot.note,
-    status: corrected ? "confirmed" : "excluded",
+    status: stands ? "confirmed" : "excluded",
     origin: "extracted",
     edited: corrected,
     sourceGone: true,
@@ -2015,6 +2022,37 @@ export type AppliedDecisions = {
   /** Things the user should know about how this pass treated their decisions. */
   notes: string[];
 };
+
+/**
+ * What to tell the user about a decision that matched a fact in the new reading
+ * without matching it by id.
+ *
+ * The honest distinction: a line that MOVED is not the same thing as a line whose
+ * CONTENT changed while its number stood still. Saying "now sits on a different
+ * line" for the second case asserts a move that never happened, so the line
+ * numbers are compared and the wording follows what is actually true.
+ */
+function movedNote(entry: { value: string; was: FactSource | null; now: FactSource }): string {
+  const tail = "Your decision still applies — check the line quoted beside it.";
+  const wasLine = entry.was?.kind === "resume" ? entry.was.line : null;
+  const nowLine = entry.now.kind === "resume" ? entry.now.line : null;
+  if (wasLine !== null && nowLine !== null) {
+    if (wasLine !== nowLine) {
+      return (
+        `“${entry.value}” now sits on a different line of your material than when you decided about ` +
+        `it — line ${nowLine} now, line ${wasLine} then. ${tail}`
+      );
+    }
+    return (
+      `The line “${entry.value}” was read from is still line ${nowLine} of your material, but the ` +
+      `wording on that line has changed since you decided about it. ${tail}`
+    );
+  }
+  return (
+    `“${entry.value}” reads differently in your material now than when you decided about it, and not ` +
+    `from the same place in it. ${tail}`
+  );
+}
 
 /**
  * The user's decisions applied to a freshly extracted fact set. Pure: same facts
@@ -2041,7 +2079,7 @@ export function applyDecisions(base: Fact[], decisions: FactDecision[]): Applied
 
   for (const category of FACT_CATEGORY_ORDER) {
     const inCategory = base.filter((fact) => fact.category === category);
-    const moved: Array<{ id: string; value: string }> = [];
+    const moved: Array<{ id: string; value: string; was: FactSource | null; now: FactSource }> = [];
     const rows: Fact[] = [];
 
     for (const fact of inCategory) {
@@ -2056,15 +2094,40 @@ export function applyDecisions(base: Fact[], decisions: FactDecision[]): Applied
       if (byId) matched.add(byId.id);
       if (byValue && !byId) {
         matched.add(byValue.id);
-        moved.push({ id: byValue.id, value: fact.value });
+        moved.push({
+          id: byValue.id,
+          value: fact.value,
+          was: byValue.snapshot?.source ?? null,
+          now: fact.source,
+        });
       }
       rows.push(applyOne(fact, byValue, !byValue && excludedValues.has(key)));
     }
 
+    // Facts the user added themselves, oldest first. The same fact added twice
+    // (a double press, or typed in again with the same value) is one fact: the
+    // copy is not listed a second time, and the user is told rather than shown
+    // the same row twice as if we had found two things.
+    const addedRows: FactDecision[] = [];
     for (const decision of decisions) {
       if (decision.category !== category || decision.action !== "add") continue;
-      rows.push(addedFact(decision));
       matched.add(decision.id);
+      addedRows.push(decision);
+    }
+    addedRows.sort((a, b) => (a.at === b.at ? a.id.localeCompare(b.id) : a.at.localeCompare(b.at)));
+    const listedAdds = new Map<string, string>();
+    for (const decision of addedRows) {
+      const key = decision.valueKey || factValueKey(decision.category, decision.value ?? "");
+      if (listedAdds.has(key)) {
+        const value = decision.value ?? deriveFactValue(decision.category, decision.fields ?? {}, "");
+        notes.push(
+          `You added “${value}” more than once, so it is listed once, from when you first added it. ` +
+            "Nothing else about your other facts changed."
+        );
+        continue;
+      }
+      listedAdds.set(key, decision.id);
+      rows.push(addedFact(decision));
     }
 
     for (const decision of decisions) {
@@ -2076,10 +2139,7 @@ export function applyDecisions(base: Fact[], decisions: FactDecision[]): Applied
     }
 
     for (const entry of moved) {
-      notes.push(
-        `“${entry.value}” now sits on a different line of your material than when you decided about ` +
-          "it. Your decision still applies — check the line quoted beside it."
-      );
+      notes.push(movedNote(entry));
     }
 
     facts.push(...rows);
@@ -2314,6 +2374,20 @@ export function addFact(
     return { ok: false, error: "Fill in the value before adding it." };
   }
   const value = deriveFactValue(category, fields);
+  // The same fact added twice is still one fact. Refusing the second copy is
+  // what keeps the list honest: without it a second press of "Add it" leaves two
+  // identical rows, and the page then shows the user a fact they added once as
+  // if they had added it twice. Nothing is inferred by refusing — the fact they
+  // already have is theirs and stays where it is.
+  const valueKey = factValueKey(category, value);
+  if (state.decisions.some((decision) => decision.action === "add" && decision.valueKey === valueKey)) {
+    return {
+      ok: false,
+      error:
+        `“${value}” is already in your list — you added it yourself, and it is listed as yours. ` +
+        "Correct it there instead of adding it again.",
+    };
+  }
   const userNote = typeof rawNote === "string" ? rawNote.trim().slice(0, NOTE_MAX) : "";
   const at = nowIso();
   const decision: FactDecision = {
@@ -2324,7 +2398,7 @@ export function addFact(
     fields,
     value,
     userNote: userNote || undefined,
-    valueKey: factValueKey(category, value),
+    valueKey,
     at,
   };
   const result = store(
