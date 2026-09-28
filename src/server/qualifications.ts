@@ -30,13 +30,24 @@
  */
 import { createHash } from "node:crypto";
 import * as db from "~/db";
-import { FACT_CATEGORY_COPY, FACT_CATEGORY_ORDER, deriveFactValue } from "~/types";
+import {
+  FACT_CATEGORY_COPY,
+  FACT_CATEGORY_ORDER,
+  FACT_FIELDS,
+  deriveFactValue,
+  emptyFactConfirmations,
+  factValueKey,
+} from "~/types";
 import type {
   ExtractionReport,
   Fact,
   FactCategory,
+  FactConfirmation,
+  FactConfirmations,
+  FactDecision,
   FactDraft,
   FactSource,
+  FactSnapshot,
   SectionSummary,
 } from "~/types";
 
@@ -1710,8 +1721,12 @@ export function extractFacts(input: QualificationInput): {
  * Bumped whenever the extractor changes in a way that would produce different
  * facts from the same material. Stored rows that predate it are recomputed on
  * the next read rather than shown stale.
+ *
+ * v2: the user's own decisions (kept / corrected / excluded / added) live beside
+ * the extracted facts, so an extractor change re-reads the facts and re-applies
+ * those decisions instead of reusing a stored set.
  */
-export const FACTS_VERSION = 1;
+export const FACTS_VERSION = 2;
 
 /** A stable fingerprint of exactly the inputs the extractor reads. */
 export function inputFingerprint(input: QualificationInput): string {
@@ -1732,14 +1747,6 @@ export function inputFingerprint(input: QualificationInput): string {
   ]);
   return createHash("sha256").update(payload).digest("hex").slice(0, 32);
 }
-
-export type QualificationState = {
-  facts: Fact[];
-  report: ExtractionReport;
-  computedAt: string;
-  /** True when this read had to re-read the material (never stored, or changed). */
-  recomputed: boolean;
-};
 
 function parseStored<T>(raw: string, fallback: T): T {
   try {
@@ -1764,15 +1771,26 @@ function looksLikeFacts(value: unknown): value is Fact[] {
   );
 }
 
+/** What the extractor read, before any decision of the user's is applied. */
+export type BaseFacts = {
+  facts: Fact[];
+  report: ExtractionReport;
+  computedAt: string;
+  /** True when this read had to re-read the material (never stored, or changed). */
+  recomputed: boolean;
+};
+
 /**
- * The facts for this account, recomputed when the material has changed.
+ * The extracted facts for this account, recomputed when the material changed.
  *
  * The stored row carries a fingerprint of the résumé text and profile fields it
- * was read from. If the user edits their résumé — or uploads a new one — the
- * next visit sees a different fingerprint and re-reads, so this page can never
- * show facts from material that has since been replaced.
+ * was read from. If the user edits their résumé — or uploads a new one — the next
+ * visit sees a different fingerprint and re-reads, so nothing can show facts from
+ * material that has since been replaced. This function knows nothing about the
+ * user's decisions: those are applied on top, and stored separately, so a
+ * re-read can never take one of them with it.
  */
-export function ensureFacts(userId: string): QualificationState {
+export function baseFactsFor(userId: string): BaseFacts {
   const input = inputFromProfile(db.getProfile(userId));
   const fingerprint = inputFingerprint(input);
   const stored = db.getQualifications(userId);
@@ -1786,12 +1804,606 @@ export function ensureFacts(userId: string): QualificationState {
   }
 
   const { facts, report } = extractFacts(input);
-  const computedAt = report.extractedAt;
   db.saveQualifications(userId, {
     factsJson: JSON.stringify(facts),
     reportJson: JSON.stringify(report),
     inputHash: fingerprint,
-    computedAt,
+    computedAt: report.extractedAt,
   });
-  return { facts, report, computedAt, recomputed: true };
+  return { facts, report, computedAt: report.extractedAt, recomputed: true };
+}
+
+// ----------------------------------------------------------- the decisions ---
+//
+// Everything below is the user's own record: what they kept, corrected, excluded
+// or added, and when they confirmed a set. Stored in its own table, keyed by
+// account, so editing the résumé re-reads the facts without touching any of it.
+
+/** How many decisions one account can hold before we stop accepting more. */
+const MAX_DECISIONS = 400;
+/** Longest value we will store in a single fact field. */
+const FIELD_MAX = 2000;
+/** Longest note the user can attach to a fact they added. */
+const NOTE_MAX = 500;
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+/** The fact exactly as it read, so a decision can outlive the line behind it. */
+export function snapshotOf(fact: Fact): FactSnapshot {
+  return {
+    label: fact.label,
+    value: fact.originalValue ?? fact.value,
+    quote: fact.quote,
+    note: fact.note,
+    source: fact.source,
+  };
+}
+
+function looksLikeDecisions(value: unknown): value is FactDecision[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        typeof item === "object" &&
+        item !== null &&
+        typeof (item as FactDecision).id === "string" &&
+        typeof (item as FactDecision).category === "string" &&
+        typeof (item as FactDecision).action === "string" &&
+        typeof (item as FactDecision).valueKey === "string"
+    )
+  );
+}
+
+function looksLikeConfirmations(value: unknown): value is FactConfirmations {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "categories" in value &&
+    typeof (value as FactConfirmations).categories === "object" &&
+    (value as FactConfirmations).categories !== null
+  );
+}
+
+export type StoredDecisions = {
+  decisions: FactDecision[];
+  confirmations: FactConfirmations;
+  updatedAt: string | null;
+};
+
+/** The user's stored decisions and confirmations. Never throws on bad JSON. */
+export function readDecisions(userId: string): StoredDecisions {
+  const stored = db.getQualificationDecisions(userId);
+  if (!stored) return { decisions: [], confirmations: emptyFactConfirmations(), updatedAt: null };
+  const rawDecisions = parseStored<unknown>(stored.decisions_json, []);
+  const rawConfirmations = parseStored<unknown>(stored.confirmations_json, null);
+  return {
+    decisions: looksLikeDecisions(rawDecisions) ? rawDecisions : [],
+    confirmations: looksLikeConfirmations(rawConfirmations)
+      ? rawConfirmations
+      : emptyFactConfirmations(),
+    updatedAt: stored.updated_at,
+  };
+}
+
+function writeDecisions(
+  userId: string,
+  decisions: FactDecision[],
+  confirmations: FactConfirmations
+): void {
+  db.saveQualificationDecisions(userId, {
+    decisionsJson: JSON.stringify(decisions),
+    confirmationsJson: JSON.stringify(confirmations),
+    updatedAt: nowIso(),
+  });
+}
+
+/**
+ * A fingerprint of a set of facts as the user sees it. Stored when they confirm,
+ * so a later change can be told apart from the set they actually signed off.
+ */
+export function setHash(facts: Fact[], scope: "overall" | FactCategory): string {
+  const rows = (scope === "overall" ? facts : facts.filter((fact) => fact.category === scope))
+    .map((fact) => [fact.id, fact.value, fact.edited, fact.status, fact.sourceGone ?? false])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  return createHash("sha256").update(JSON.stringify([scope, rows])).digest("hex").slice(0, 32);
+}
+
+/** Applies a decision to one extracted fact, or reports it as still a suggestion. */
+function applyOne(fact: Fact, decision: FactDecision | undefined, tombstoned: boolean): Fact {
+  if (decision?.action === "exclude" || tombstoned) {
+    // An exclusion that also carried a correction keeps the user's words, so
+    // undoing the exclusion does not lose anything they typed.
+    const fields = decision?.fields;
+    return {
+      ...fact,
+      fields: fields ?? fact.fields,
+      value: fields ? deriveFactValue(fact.category, fields, fact.value) : fact.value,
+      status: "excluded",
+      edited: Boolean(fields),
+      decidedAt: decision?.at,
+      originalValue: decision?.snapshot?.value ?? fact.value,
+      updatedAt: decision?.at ?? fact.updatedAt,
+    };
+  }
+  if (decision?.action === "correct" && decision.fields) {
+    return {
+      ...fact,
+      fields: decision.fields,
+      value: deriveFactValue(fact.category, decision.fields, fact.value),
+      status: "confirmed",
+      edited: true,
+      decidedAt: decision.at,
+      originalValue: decision.snapshot?.value ?? fact.value,
+      updatedAt: decision.at,
+    };
+  }
+  if (decision?.action === "keep") {
+    return { ...fact, status: "confirmed", decidedAt: decision.at, updatedAt: decision.at };
+  }
+  return { ...fact, status: "suggested" };
+}
+
+/** What a fact the user added themselves is called in the list. */
+const ADDED_LABELS: Record<FactCategory, string> = {
+  identity: "Detail you added",
+  role: "Role you added",
+  education: "Education you added",
+  skill: "Skill you added",
+  achievement: "Result you added",
+  certification: "Certification you added",
+  language: "Language you added",
+  work_rights: "Work rights you added",
+};
+
+/** A fact the user added themselves. Never dressed up as coming from the résumé. */
+function addedFact(decision: FactDecision): Fact {
+  const fields = decision.fields ?? {};
+  return {
+    id: decision.id,
+    category: decision.category,
+    label: ADDED_LABELS[decision.category],
+    value: deriveFactValue(decision.category, fields, decision.value ?? ""),
+    fields,
+    source: { kind: "user" },
+    quote: decision.value ?? deriveFactValue(decision.category, fields, ""),
+    note: "",
+    status: "confirmed",
+    origin: "user",
+    edited: false,
+    decidedAt: decision.at,
+    userNote: decision.userNote,
+    createdAt: decision.at,
+    updatedAt: decision.at,
+  };
+}
+
+/**
+ * A fact whose source line is no longer in the material, but which the user had
+ * decided about. Their version is kept — corrected facts stay visible with the
+ * original quote beside them and the change stated — because a résumé edit must
+ * never quietly delete something the user typed.
+ */
+function revivedFact(decision: FactDecision): Fact | null {
+  if (!decision.snapshot) return null;
+  const fields = decision.fields ?? {};
+  const userValue = decision.value ?? deriveFactValue(decision.category, fields, "");
+  const corrected = decision.action === "correct";
+  return {
+    id: decision.id,
+    category: decision.category,
+    label: decision.snapshot.label,
+    value: corrected ? userValue || decision.snapshot.value : decision.snapshot.value,
+    fields: corrected ? fields : {},
+    source: decision.snapshot.source,
+    quote: decision.snapshot.quote,
+    note: decision.snapshot.note,
+    status: corrected ? "confirmed" : "excluded",
+    origin: "extracted",
+    edited: corrected,
+    sourceGone: true,
+    decidedAt: decision.at,
+    originalValue: decision.snapshot.value,
+    createdAt: decision.at,
+    updatedAt: decision.at,
+  };
+}
+
+export type AppliedDecisions = {
+  facts: Fact[];
+  /** Things the user should know about how this pass treated their decisions. */
+  notes: string[];
+};
+
+/**
+ * The user's decisions applied to a freshly extracted fact set. Pure: same facts
+ * and same decisions always give the same result, which is what the check script
+ * leans on.
+ *
+ * How a decision finds the fact it was made about, in order:
+ *   1. the same fact id (same category, source and value);
+ *   2. failing that, the same value in the same category — so a résumé whose
+ *      lines have moved, or been re-uploaded, keeps the decisions made about it;
+ *   3. failing that, the decision stands on its own: a correction stays visible
+ *      marked as no longer sourced, an exclusion stays listed so it can be undone.
+ *
+ * A decision is never discarded: at worst it is reported as no longer matching
+ * anything in the material.
+ */
+export function applyDecisions(base: Fact[], decisions: FactDecision[]): AppliedDecisions {
+  const notes: string[] = [];
+  const excludedValues = new Set(
+    decisions.filter((decision) => decision.action === "exclude").map((decision) => decision.valueKey)
+  );
+  const matched = new Set<string>();
+  const facts: Fact[] = [];
+
+  for (const category of FACT_CATEGORY_ORDER) {
+    const inCategory = base.filter((fact) => fact.category === category);
+    const moved: Array<{ id: string; value: string }> = [];
+    const rows: Fact[] = [];
+
+    for (const fact of inCategory) {
+      const byId = decisions.find((decision) => decision.id === fact.id && decision.action !== "add");
+      const key = factValueKey(fact.category, fact.value);
+      const byValue =
+        byId ??
+        decisions.find(
+          (decision) =>
+            decision.action !== "add" && decision.valueKey === key && !matched.has(decision.id)
+        );
+      if (byId) matched.add(byId.id);
+      if (byValue && !byId) {
+        matched.add(byValue.id);
+        moved.push({ id: byValue.id, value: fact.value });
+      }
+      rows.push(applyOne(fact, byValue, !byValue && excludedValues.has(key)));
+    }
+
+    for (const decision of decisions) {
+      if (decision.category !== category || decision.action !== "add") continue;
+      rows.push(addedFact(decision));
+      matched.add(decision.id);
+    }
+
+    for (const decision of decisions) {
+      if (decision.category !== category || decision.action === "add" || matched.has(decision.id)) {
+        continue;
+      }
+      const revived = revivedFact(decision);
+      if (revived) rows.push(revived);
+    }
+
+    for (const entry of moved) {
+      notes.push(
+        `“${entry.value}” now sits on a different line of your material than when you decided about ` +
+          "it. Your decision still applies — check the line quoted beside it."
+      );
+    }
+
+    facts.push(...rows);
+  }
+
+  return { facts, notes };
+}
+
+/** Everything the review screen (and, later, the kit) needs about one account. */
+export type FactState = {
+  facts: Fact[];
+  /** Facts the material yielded before the user's decisions were applied. */
+  baseFacts: Fact[];
+  report: ExtractionReport;
+  computedAt: string;
+  recomputed: boolean;
+  decisions: FactDecision[];
+  confirmations: FactConfirmations;
+  /** Notes about how the user's decisions were treated on this pass. */
+  decisionNotes: string[];
+  decisionsUpdatedAt: string | null;
+};
+
+/** The facts for this account, with the user's own decisions applied. */
+export function ensureFacts(userId: string): FactState {
+  const base = baseFactsFor(userId);
+  const stored = readDecisions(userId);
+  const applied = applyDecisions(base.facts, stored.decisions);
+  return {
+    facts: applied.facts,
+    baseFacts: base.facts,
+    report: base.report,
+    computedAt: base.computedAt,
+    recomputed: base.recomputed,
+    decisions: stored.decisions,
+    confirmations: stored.confirmations,
+    decisionNotes: applied.notes,
+    decisionsUpdatedAt: stored.updatedAt,
+  };
+}
+
+/**
+ * The facts the user has confirmed, for stage 3 to answer from. Only confirmed,
+ * non-excluded facts come back: anything still a suggestion, or that the user
+ * excluded, is not usable, and nothing is ever supplied for a gap.
+ */
+export function confirmedFacts(userId: string): { facts: Fact[]; confirmations: FactConfirmations } {
+  const state = ensureFacts(userId);
+  return {
+    facts: state.facts.filter((fact) => fact.status === "confirmed"),
+    confirmations: state.confirmations,
+  };
+}
+
+// ------------------------------------------------------- changing the record ---
+
+export type Outcome = { ok: true } | { ok: false; error: string };
+
+const NOT_IN_LIST =
+  "That fact isn't in your list any more — your material may have changed. Reload the page and try again.";
+
+/** Which fields a category accepts, with the values trimmed and capped. */
+function readFields(category: FactCategory, raw: unknown): Record<string, string> {
+  const source = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  const out: Record<string, string> = {};
+  for (const spec of FACT_FIELDS[category]) {
+    const value = source[spec.key];
+    out[spec.key] = typeof value === "string" ? value.trim().slice(0, FIELD_MAX) : "";
+  }
+  return out;
+}
+
+/** The one field whose emptiness makes a fact meaningless. */
+function missingRequired(category: FactCategory, fields: Record<string, string>): boolean {
+  if (category === "role") return !fields.title && !fields.company;
+  if (category === "education") return !fields.qualification && !fields.school;
+  return !fields.value;
+}
+
+function upsert(decisions: FactDecision[], decision: FactDecision): FactDecision[] {
+  return [...decisions.filter((existing) => existing.id !== decision.id), decision];
+}
+
+/** Finds the fact a decision is about: in the current material, or in the record. */
+function locate(
+  state: FactState,
+  id: string
+): { fact: Fact; decision?: FactDecision } | null {
+  const applied = state.facts.find((fact) => fact.id === id);
+  const base = state.baseFacts.find((fact) => fact.id === id);
+  const existing = state.decisions.find((decision) => decision.id === id);
+  if (base) return { fact: base, decision: existing };
+  if (applied && applied.origin === "user") return { fact: applied, decision: existing };
+  if (applied) return { fact: applied, decision: existing };
+  return null;
+}
+
+/** Re-writes the record, refusing to grow without bound. */
+function store(
+  userId: string,
+  decisions: FactDecision[],
+  confirmations: FactConfirmations,
+  setChanged: boolean,
+  category: FactCategory
+): Outcome {
+  if (decisions.length > MAX_DECISIONS) {
+    return {
+      ok: false,
+      error:
+        `You have ${String(MAX_DECISIONS)} saved decisions on your facts, which is as many as this ` +
+        "page will hold. Remove a few facts you added before adding more.",
+    };
+  }
+  // A confirmed set that has just changed is no longer the set that was
+  // confirmed, so the confirmation is cleared and the user is told to re-confirm.
+  const next: FactConfirmations = setChanged
+    ? {
+        overall: null,
+        categories: { ...confirmations.categories, [category]: null },
+      }
+    : confirmations;
+  writeDecisions(userId, decisions, next);
+  return { ok: true };
+}
+
+/**
+ * KEEP a fact — the user says it is right. This is what makes a fact usable.
+ */
+export function keepFact(userId: string, id: string): Outcome {
+  const state = ensureFacts(userId);
+  const found = locate(state, id);
+  if (!found) return { ok: false, error: NOT_IN_LIST };
+  const decision: FactDecision = {
+    id: found.fact.id,
+    category: found.fact.category,
+    action: "keep",
+    snapshot: snapshotOf(found.fact),
+    valueKey: factValueKey(found.fact.category, found.fact.originalValue ?? found.fact.value),
+    at: nowIso(),
+  };
+  return store(userId, upsert(state.decisions, decision), state.confirmations, false, found.fact.category);
+}
+
+/**
+ * CORRECT a fact — the user replaces part of it with their own wording. The
+ * original line is kept in the record and shown beside the corrected fact, marked
+ * as edited by them.
+ */
+export function correctFact(userId: string, id: string, rawFields: unknown): Outcome {
+  const state = ensureFacts(userId);
+  const found = locate(state, id);
+  if (!found) return { ok: false, error: NOT_IN_LIST };
+  const fields = readFields(found.fact.category, rawFields);
+  if (missingRequired(found.fact.category, fields)) {
+    return { ok: false, error: "A fact needs a value — fill in the main field before saving." };
+  }
+  const decision: FactDecision = {
+    id: found.fact.id,
+    category: found.fact.category,
+    action: "correct",
+    fields,
+    value: deriveFactValue(found.fact.category, fields),
+    snapshot: snapshotOf(found.fact),
+    valueKey: factValueKey(found.fact.category, found.fact.originalValue ?? found.fact.value),
+    at: nowIso(),
+  };
+  return store(userId, upsert(state.decisions, decision), state.confirmations, true, found.fact.category);
+}
+
+/**
+ * EXCLUDE a fact — the user says it should not be used. Nothing is deleted: the
+ * fact stays listed as excluded so it can be brought back, and its value is
+ * remembered so re-uploading the same material does not quietly restore it.
+ */
+export function excludeFact(userId: string, id: string): Outcome {
+  const state = ensureFacts(userId);
+  const found = locate(state, id);
+  if (!found) return { ok: false, error: NOT_IN_LIST };
+  const previous = found.decision;
+  const decision: FactDecision = {
+    id: found.fact.id,
+    category: found.fact.category,
+    action: "exclude",
+    // Anything the user typed for this fact is kept, so undoing the exclusion
+    // restores their version rather than the machine's.
+    fields: previous?.fields,
+    value: previous?.value,
+    snapshot: previous?.snapshot ?? snapshotOf(found.fact),
+    valueKey: previous?.valueKey ?? factValueKey(found.fact.category, found.fact.value),
+    at: nowIso(),
+  };
+  return store(userId, upsert(state.decisions, decision), state.confirmations, true, found.fact.category);
+}
+
+/**
+ * Undo a decision — by fact id, or by the value it was made about (which is how a
+ * fact excluded before the material changed is brought back). The fact returns to
+ * whatever it is on its own: a suggestion, never confirmed on the user's behalf.
+ */
+export function restoreFact(userId: string, id: string): Outcome {
+  const state = ensureFacts(userId);
+  const target = state.facts.find((fact) => fact.id === id);
+  const key = target ? factValueKey(target.category, target.originalValue ?? target.value) : "";
+  const kept = state.decisions.filter(
+    (decision) => decision.id !== id && (key === "" || decision.valueKey !== key)
+  );
+  if (kept.length === state.decisions.length) return { ok: false, error: NOT_IN_LIST };
+  const category = target?.category ?? state.decisions.find((d) => d.id === id)?.category;
+  return store(
+    userId,
+    kept,
+    state.confirmations,
+    true,
+    category ?? "identity"
+  );
+}
+
+/**
+ * ADD a fact the extractor did not find. It is stored as the user's own — the
+ * review screen labels it "you added this" and never quotes the résumé for it,
+ * because it did not come from there.
+ */
+export function addFact(
+  userId: string,
+  category: FactCategory,
+  rawFields: unknown,
+  rawNote: unknown
+): Outcome & { id?: string } {
+  const state = ensureFacts(userId);
+  const fields = readFields(category, rawFields);
+  if (missingRequired(category, fields)) {
+    return { ok: false, error: "Fill in the value before adding it." };
+  }
+  const value = deriveFactValue(category, fields);
+  const userNote = typeof rawNote === "string" ? rawNote.trim().slice(0, NOTE_MAX) : "";
+  const at = nowIso();
+  const decision: FactDecision = {
+    // Deterministic id: same category, value and moment ⇒ same id.
+    id: `user-${category}-${shortHash(`${category}|${value}|${at}`)}`,
+    category,
+    action: "add",
+    fields,
+    value,
+    userNote: userNote || undefined,
+    valueKey: factValueKey(category, value),
+    at,
+  };
+  const result = store(
+    userId,
+    upsert(state.decisions, decision),
+    state.confirmations,
+    true,
+    category
+  );
+  return result.ok ? { ok: true, id: decision.id } : result;
+}
+
+/**
+ * CONFIRM a set as right: one category, or everything at once. The time is
+ * stored, together with a fingerprint of the set that was confirmed, so a later
+ * edit reads as "changed since you confirmed" rather than passing off an edited
+ * set as the confirmed one. Confirming also keeps every fact in scope, so the
+ * individual facts the user has seen and accepted stay usable.
+ */
+export function confirmFacts(userId: string, scope: "overall" | FactCategory): Outcome {
+  const state = ensureFacts(userId);
+  const inScope =
+    scope === "overall" ? state.facts : state.facts.filter((fact) => fact.category === scope);
+  const usable = inScope.filter((fact) => fact.status !== "excluded");
+  if (usable.length === 0) {
+    return {
+      ok: false,
+      error:
+        "There's nothing to confirm here yet — this set is empty. Add what's true for you and confirm that instead.",
+    };
+  }
+  const at = nowIso();
+  let decisions = state.decisions;
+  for (const fact of usable) {
+    if (state.decisions.some((decision) => decision.id === fact.id)) continue;
+    decisions = upsert(decisions, {
+      id: fact.id,
+      category: fact.category,
+      action: fact.origin === "user" ? "add" : "keep",
+      ...(fact.origin === "user"
+        ? { fields: fact.fields, value: fact.value, userNote: fact.userNote }
+        : { snapshot: snapshotOf(fact) }),
+      valueKey: factValueKey(fact.category, fact.originalValue ?? fact.value),
+      at,
+    });
+  }
+  // Hash the set after the keeps above, which is exactly what the user is
+  // signing off: every fact in scope, in the state they have just reviewed.
+  const confirmed = applyDecisions(state.baseFacts, decisions).facts;
+  const confirmations: FactConfirmations =
+    scope === "overall"
+      ? {
+          overall: { at, setHash: setHash(confirmed, "overall") },
+          categories: Object.fromEntries(
+            FACT_CATEGORY_ORDER.map((category) => [
+              category,
+              confirmed.some((fact) => fact.category === category)
+                ? { at, setHash: setHash(confirmed, category) }
+                : state.confirmations.categories[category],
+            ])
+          ) as Record<FactCategory, FactConfirmation | null>,
+        }
+      : {
+          overall: null,
+          categories: {
+            ...state.confirmations.categories,
+            [scope]: { at, setHash: setHash(confirmed, scope) },
+          },
+        };
+  return store(userId, decisions, confirmations, false, scope === "overall" ? "identity" : scope);
+}
+
+/** A confirmation entry only counts while the set it describes is unchanged. */
+export function confirmationMatches(
+  confirmations: FactConfirmations,
+  facts: Fact[],
+  scope: "overall" | FactCategory
+): boolean {
+  const entry = scope === "overall" ? confirmations.overall : confirmations.categories[scope];
+  if (!entry) return false;
+  return entry.setHash === setHash(facts, scope);
 }

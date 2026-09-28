@@ -14,20 +14,24 @@ import * as db from "~/db";
 import { currentUser, endSession, startSession } from "~/server/auth";
 import { fetchPostingText, normalisePostingUrl } from "~/server/fetch-posting";
 import { generateKit, readPostingHints } from "~/server/generate";
-import { ensureFacts } from "~/server/qualifications";
+import * as qualifications from "~/server/qualifications";
 import { emailStatus, sendPasswordResetEmail } from "~/server/email";
 import { checkAndRecord, emailBucket, ipBucket, userBucket } from "~/server/ratelimit";
 import type { RuleName } from "~/server/ratelimit";
+import type { Outcome } from "~/server/qualifications";
 import {
   MAX_UPLOAD_BYTES,
   extractTextFromBytes,
   sniffUpload,
 } from "~/server/extract";
-import { HUMAN_MAX_SIZE } from "~/types";
+import { FACT_CATEGORY_ORDER, HUMAN_MAX_SIZE } from "~/types";
 import type {
   ApplicationSummary,
+  ConfirmationStatus,
   ExtractionReport,
   Fact,
+  FactCategory,
+  FactConfirmations,
   Kit,
   MaterialSummary,
   ProfileFormValues,
@@ -498,29 +502,62 @@ export const loadProfile = createServerFn({ method: "POST" }).handler(
   }
 );
 /**
- * The qualifications facts for the signed-in account — read-only.
+ * The qualifications facts for the signed-in account, with the user's own
+ * decisions applied.
  *
  * Deterministic and offline: the facts module reads the user's own résumé text
  * and vault fields, so no model is called and nothing can be invented. It
- * re-reads the material whenever it has changed since the stored pass, which is
- * what makes the page show what the current résumé says rather than an old
- * version of it. Reading is enough to (re)build the facts; there is no path
- * here that edits or confirms one — that is a later piece of work.
+ * re-reads the material whenever it has changed since the stored pass, then
+ * re-applies the user's decisions (kept / corrected / excluded / added) on top —
+ * a re-read never discards one of them.
+ *
+ * The confirmation status is computed here, not in the browser: it compares a
+ * fingerprint of the set as it stands now with the one stored when the user
+ * confirmed it, so an edited set reads as "changed" rather than confirmed.
  */
 export const loadQualifications = createServerFn({ method: "POST" }).handler(
   async (): Promise<
-    Result<{ facts: Fact[]; report: ExtractionReport; computedAt: string; recomputed: boolean }>
+    Result<{
+      facts: Fact[];
+      report: ExtractionReport;
+      computedAt: string;
+      recomputed: boolean;
+      decisionNotes: string[];
+      decisionsUpdatedAt: string | null;
+      confirmations: FactConfirmations;
+      confirmationStatus: { overall: ConfirmationStatus; categories: Record<FactCategory, ConfirmationStatus> };
+    }>
   > => {
     const user = currentUser();
     if (!user) return { ok: false, error: NOT_SIGNED_IN };
     try {
-      const state = ensureFacts(user.id);
+      const state = qualifications.ensureFacts(user.id);
       return {
         ok: true,
         facts: state.facts,
         report: state.report,
         computedAt: state.computedAt,
         recomputed: state.recomputed,
+        decisionNotes: state.decisionNotes,
+        decisionsUpdatedAt: state.decisionsUpdatedAt,
+        confirmations: state.confirmations,
+        confirmationStatus: {
+          overall: qualifications.confirmationMatches(state.confirmations, state.facts, "overall")
+            ? "confirmed"
+            : state.confirmations.overall
+              ? "changed"
+              : "pending",
+          categories: Object.fromEntries(
+            FACT_CATEGORY_ORDER.map((category) => [
+              category,
+              qualifications.confirmationMatches(state.confirmations, state.facts, category)
+                ? "confirmed"
+                : state.confirmations.categories[category]
+                  ? "changed"
+                  : "pending",
+            ])
+          ) as Record<FactCategory, ConfirmationStatus>,
+        },
       };
     } catch (error) {
       return {
@@ -532,6 +569,114 @@ export const loadQualifications = createServerFn({ method: "POST" }).handler(
     }
   }
 );
+
+// --------------------------------------------------- reviewing the fact set ---
+//
+// Every one of these writes only what the user themselves decided. There is no
+// path here that changes a fact on the user's behalf, and none of them sends
+// anything anywhere: the app has no submit path at all.
+
+/** The one thing these handlers need from the browser: which fact, and what. */
+function readFactId(raw: unknown): string {
+  return str(raw, 200);
+}
+
+function readScope(raw: unknown): "overall" | FactCategory | null {
+  if (raw === "overall") return "overall";
+  return FACT_CATEGORY_ORDER.includes(raw as FactCategory) ? (raw as FactCategory) : null;
+}
+
+/** Wraps one decision write so every failure reads the same way. */
+function runDecision(work: () => Outcome): Result {
+  try {
+    const result = work();
+    return result.ok ? { ok: true } : { ok: false, error: result.error };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        "We couldn't save that just now — nothing was changed. Try again in a moment." +
+        (error instanceof Error ? ` (${error.message})` : ""),
+    };
+  }
+}
+
+/** Keep a fact: the user confirms it is right and it becomes usable. */
+export const keepFact = createServerFn({ method: "POST" })
+  .validator((input: { id?: unknown }) => input)
+  .handler(async ({ data }): Promise<Result> => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    const id = readFactId(data?.id);
+    if (!id) return { ok: false, error: "We didn't get a fact to keep — reload the page and try again." };
+    return runDecision(() => qualifications.keepFact(user.id, id));
+  });
+
+/** Correct a fact: the user's own wording replaces part of it, original line kept. */
+export const correctFact = createServerFn({ method: "POST" })
+  .validator((input: { id?: unknown; fields?: unknown }) => input)
+  .handler(async ({ data }): Promise<Result> => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    const id = readFactId(data?.id);
+    if (!id) return { ok: false, error: "We didn't get a fact to save — reload the page and try again." };
+    return runDecision(() => qualifications.correctFact(user.id, id, data?.fields));
+  });
+
+/** Exclude a fact: not used anywhere, still listed so it can be brought back. */
+export const excludeFact = createServerFn({ method: "POST" })
+  .validator((input: { id?: unknown }) => input)
+  .handler(async ({ data }): Promise<Result> => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    const id = readFactId(data?.id);
+    if (!id) return { ok: false, error: "We didn't get a fact to exclude — reload the page and try again." };
+    return runDecision(() => qualifications.excludeFact(user.id, id));
+  });
+
+/** Undo a decision, returning the fact to whatever the material says on its own. */
+export const restoreFact = createServerFn({ method: "POST" })
+  .validator((input: { id?: unknown }) => input)
+  .handler(async ({ data }): Promise<Result> => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    const id = readFactId(data?.id);
+    if (!id) return { ok: false, error: "We didn't get a fact to restore — reload the page and try again." };
+    return runDecision(() => qualifications.restoreFact(user.id, id));
+  });
+
+/**
+ * Add a fact the extractor missed. It is stored as the user's own: labelled
+ * "you added this", with no résumé quote attached, because it did not come from
+ * one.
+ */
+export const addFact = createServerFn({ method: "POST" })
+  .validator((input: { category?: unknown; fields?: unknown; note?: unknown }) => input)
+  .handler(async ({ data }): Promise<Result> => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    const category = readScope(data?.category);
+    if (!category || category === "overall") {
+      return { ok: false, error: "Choose which part of your qualifications this belongs to." };
+    }
+    return runDecision(() => qualifications.addFact(user.id, category, data?.fields, data?.note));
+  });
+
+/**
+ * Confirm a set is right — one category, or everything at once — and store when.
+ * This is the flag stage 3 will gate on before answering a real application field
+ * from these facts.
+ */
+export const confirmFacts = createServerFn({ method: "POST" })
+  .validator((input: { scope?: unknown }) => input)
+  .handler(async ({ data }): Promise<Result> => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    const scope = readScope(data?.scope);
+    if (!scope) return { ok: false, error: "We didn't get a set to confirm — reload the page and try again." };
+    return runDecision(() => qualifications.confirmFacts(user.id, scope));
+  });
+
 
 export const saveProfile = createServerFn({ method: "POST" })
   .validator((input: { profile?: unknown }) => input)

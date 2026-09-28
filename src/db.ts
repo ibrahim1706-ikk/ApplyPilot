@@ -286,6 +286,19 @@ CREATE TABLE IF NOT EXISTS qualifications (
   input_hash   TEXT NOT NULL DEFAULT '',
   computed_at  TEXT NOT NULL
 );
+
+-- What the user decided about those facts: kept, corrected, excluded, or added
+-- themselves — plus when they confirmed a set and a fingerprint of the set they
+-- confirmed. Kept in its own row (not inside facts_json) for one reason: facts are
+-- recomputed whenever the résumé or the vault changes, and a recompute must never
+-- take the user's decisions with it. JSON columns stay opaque here — the shape
+-- lives in src/types.ts.
+CREATE TABLE IF NOT EXISTS qualification_decisions (
+  user_id            TEXT PRIMARY KEY,
+  decisions_json     TEXT NOT NULL DEFAULT '[]',
+  confirmations_json TEXT NOT NULL DEFAULT '{}',
+  updated_at         TEXT NOT NULL
+);
 `;
 
 // ---------------------------------------------------------------- connection ---
@@ -826,6 +839,38 @@ export function saveQualifications(
 export function deleteQualifications(userId: string): void {
   run("DELETE FROM qualifications WHERE user_id = ?", [userId]);
 }
+
+/**
+ * The user's own decisions about the facts (kept / corrected / excluded / added)
+ * and their confirmations. One row per account, opaque JSON — the same
+ * DELETE-then-INSERT write as everywhere else, so this moves to a managed
+ * Postgres unchanged.
+ */
+export type StoredQualificationsDecisions = {
+  user_id: string;
+  decisions_json: string;
+  confirmations_json: string;
+  updated_at: string;
+};
+export function getQualificationDecisions(userId: string): StoredQualificationsDecisions | null {
+  return one<StoredQualificationsDecisions>(
+    "SELECT user_id, decisions_json, confirmations_json, updated_at FROM qualification_decisions WHERE user_id = ?",
+    [userId]
+  );
+}
+export function saveQualificationDecisions(
+  userId: string,
+  input: { decisionsJson: string; confirmationsJson: string; updatedAt: string }
+): void {
+  run("DELETE FROM qualification_decisions WHERE user_id = ?", [userId]);
+  run(
+    "INSERT INTO qualification_decisions (user_id, decisions_json, confirmations_json, updated_at) VALUES (?, ?, ?, ?)",
+    [userId, input.decisionsJson, input.confirmationsJson, input.updatedAt]
+  );
+}
+export function deleteQualificationDecisions(userId: string): void {
+  run("DELETE FROM qualification_decisions WHERE user_id = ?", [userId]);
+}
 // --------------------------------------------------------- deleting an account ---
 //
 // One function, one transaction, every table that holds anything about the
@@ -843,6 +888,8 @@ export type DeletedAccount = {
   rateEvents: number;
   /** The stored qualifications fact set for this account, if it had one. */
   qualifications: number;
+  /** The user's own fact decisions and confirmations, if they had any. */
+  qualificationDecisions: number;
   /** Stored paths of the user's uploaded originals, relative to `uploadsRoot()`/userId. */
   materialPaths: string[];
 };
@@ -865,6 +912,7 @@ export function deleteAccount(userId: string): DeletedAccount | null {
     sessions: counts("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?"),
     resets: counts("SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?"),
     qualifications: counts("SELECT COUNT(*) AS n FROM qualifications WHERE user_id = ?"),
+    qualificationDecisions: counts("SELECT COUNT(*) AS n FROM qualification_decisions WHERE user_id = ?"),
     rateEvents: 0,
     materialPaths: materials.map((m) => m.stored_path),
   };
@@ -876,6 +924,7 @@ export function deleteAccount(userId: string): DeletedAccount | null {
     run("DELETE FROM sessions WHERE user_id = ?", [userId]);
     run("DELETE FROM password_resets WHERE user_id = ?", [userId]);
     run("DELETE FROM qualifications WHERE user_id = ?", [userId]);
+    run("DELETE FROM qualification_decisions WHERE user_id = ?", [userId]);
     run("DELETE FROM users WHERE id = ?", [userId]);
   })();
 
@@ -894,6 +943,10 @@ export function countRowsForUser(userId: string): Record<string, number> {
     sessions: count("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?", [userId]),
     password_resets: count("SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?", [userId]),
     qualifications: count("SELECT COUNT(*) AS n FROM qualifications WHERE user_id = ?", [userId]),
+    qualification_decisions: count(
+      "SELECT COUNT(*) AS n FROM qualification_decisions WHERE user_id = ?",
+      [userId]
+    ),
   };
 }
 
@@ -927,6 +980,11 @@ export type AccountExport = {
     facts: unknown;
     report: unknown;
     computedAt: string;
+    /** The user's own decisions about those facts (kept / corrected / excluded / added). */
+    decisions: unknown;
+    /** When they confirmed a set, and a fingerprint of the set they confirmed. */
+    confirmations: unknown;
+    decisionsUpdatedAt: string | null;
   } | null;
 };
 
@@ -966,11 +1024,17 @@ export function exportAccount(userId: string): AccountExport | null {
 /** The stored fact set, as plain data, for the account export. */
 function readQualificationsForExport(userId: string): AccountExport["qualifications"] {
   const stored = getQualifications(userId);
-  if (!stored) return null;
+  const decisions = getQualificationDecisions(userId);
+  if (!stored && !decisions) return null;
   return {
-    facts: parseUnknownJson(stored.facts_json),
-    report: parseUnknownJson(stored.report_json),
-    computedAt: stored.computed_at,
+    facts: parseUnknownJson(stored?.facts_json ?? null),
+    report: parseUnknownJson(stored?.report_json ?? null),
+    computedAt: stored?.computed_at ?? "",
+    // The user's own words — kept, corrected, excluded, added — belong in their
+    // export just as much as the facts we read for them.
+    decisions: parseUnknownJson(decisions?.decisions_json ?? null),
+    confirmations: parseUnknownJson(decisions?.confirmations_json ?? null),
+    decisionsUpdatedAt: decisions?.updated_at ?? null,
   };
 }
 
@@ -995,6 +1059,7 @@ export function tableCounts(): Record<string, number> {
     "materials",
     "password_resets",
     "qualifications",
+    "qualification_decisions",
   ];
   const out: Record<string, number> = {};
   for (const name of names) {
