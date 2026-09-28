@@ -34,7 +34,7 @@ import {
   FACT_CATEGORY_ORDER,
   FACT_FIELDS,
   factBadge,
-  factSourceLabel,
+  factSourceCaption,
   groupFacts,
 } from "~/types";
 import type {
@@ -343,7 +343,9 @@ function QualificationsPage() {
               </li>
               <li>
                 If a fact you corrected is gone from your material entirely, <strong>your version is kept</strong>{" "}
-                and marked as coming from a line your material no longer has. Nothing you typed is deleted.
+                and marked as coming from a line your material no longer has. Nothing you typed is deleted. A fact you{" "}
+                <strong>kept</strong> whose line goes the same way stays kept, and is marked the same way — we never
+                record a decision you did not make.
               </li>
               <li>
                 A fact you excluded stays excluded, and stays listed, so it never quietly returns.
@@ -666,12 +668,7 @@ function FactRow(props: {
               <blockquote className="whitespace-pre-wrap text-xs leading-relaxed text-slate-700">
                 {fact.quote}
               </blockquote>
-              <figcaption className="mt-1 text-[11px] text-slate-500">
-                {fact.source.kind === "resume" && fact.source.section !== "other"
-                  ? `${factSourceLabel(fact.source)} · read in your “${fact.source.section}” section`
-                  : factSourceLabel(fact.source)}
-                {fact.edited ? " · edited by you after we read it" : ""}
-              </figcaption>
+              <figcaption className="mt-1 text-[11px] text-slate-500">{factSourceCaption(fact)}</figcaption>
             </figure>
           )}
 
@@ -684,8 +681,9 @@ function FactRow(props: {
 
           {fact.sourceGone ? (
             <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-              This line is no longer in your material. Your version is kept as you wrote it — nothing you typed was
-              deleted — and it is marked here so you can decide whether it still applies.
+              {fact.edited
+                ? "The line this was read from is no longer in your material. Your version is kept as you wrote it — nothing you typed was deleted — and it is marked here so you can decide whether it still applies."
+                : "The line this was read from is no longer in your material. The fact is kept exactly as it was read, because you said it was right — it is marked here so you can decide whether it still applies."}
             </p>
           ) : null}
 
