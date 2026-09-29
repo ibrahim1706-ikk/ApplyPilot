@@ -3,7 +3,7 @@ import { useState } from "react";
 import { AppShell } from "~/components/AppShell";
 import { Badge, Card, CopyBlock, Input, SectionTitle, buttonStyles } from "~/components/ui";
 import { requireSession } from "~/route-guards";
-import { deleteApplication, loadApplication, regenerateKit } from "~/server/actions";
+import { deleteApplication, loadApplication, regenerateKit, takeApplicationForward } from "~/server/actions";
 
 export const Route = createFileRoute("/kit/$id")({
   beforeLoad: requireSession,
@@ -69,6 +69,21 @@ function KitPage() {
     await navigate({ to: "/applications" });
   }
 
+  async function handleTakeForward() {
+    setBusy(true);
+    setNote("");
+    const result = await takeApplicationForward({ data: { id: application.id } });
+    setBusy(false);
+    if (!result.ok) {
+      setNote(result.error);
+      return;
+    }
+    await router.invalidate();
+    setNote(
+      "Marked as the one you're taking forward. Nothing has been sent anywhere — copy each piece into the employer's own form and send it yourself."
+    );
+  }
+
   return (
     <AppShell email={context.email ?? ""}>
       <div className="flex flex-wrap items-start gap-3">
@@ -91,8 +106,27 @@ function KitPage() {
               {application.url}
             </a>
           ) : null}
+          {application.takenForwardAt ? (
+            <p className="mt-1 text-xs font-medium text-emerald-700">
+              Taken forward {dateFormatter.format(new Date(application.takenForwardAt))} — this is the one
+              you&apos;re sending yourself. Nothing has been submitted for you.
+            </p>
+          ) : null}
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className={buttonStyles.primary}
+            onClick={handleTakeForward}
+            disabled={busy || !kit || application.takenForwardAt !== null}
+            title={
+              application.takenForwardAt
+                ? "Already marked as taken forward"
+                : "Mark this kit as the one you're taking to the employer's form"
+            }
+          >
+            {application.takenForwardAt ? "Taken forward" : busy ? "Working…" : "Take this one forward"}
+          </button>
           <button type="button" className={buttonStyles.secondary} onClick={() => handleRegenerate(false)} disabled={busy}>
             {busy ? "Working…" : "Rebuild from my profile"}
           </button>
@@ -318,7 +352,9 @@ function KitPage() {
             <h2 className="text-sm font-semibold text-slate-900">Nothing has been sent anywhere</h2>
             <p className="mt-2 text-sm text-slate-600">
               ApplyPilot doesn&apos;t have your employer accounts and doesn&apos;t submit applications. Copy
-              each piece into the employer&apos;s own form, check the wording, and send it yourself.
+              each piece into the employer&apos;s own form, check the wording, and send it yourself. Marking
+              a kit as taken forward only tells ApplyPilot which one you&apos;re sending — it doesn&apos;t
+              send it.
             </p>
           </Card>
         </div>

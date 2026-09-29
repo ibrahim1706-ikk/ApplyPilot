@@ -14,6 +14,7 @@ import * as db from "~/db";
 import { currentUser, endSession, startSession } from "~/server/auth";
 import { fetchPostingText, normalisePostingUrl } from "~/server/fetch-posting";
 import { fieldAnswersFor } from "~/server/field-answers";
+import { noteProfileMaterial, recordStep } from "~/server/funnel";
 import { generateKit, readPostingHints } from "~/server/generate";
 import * as qualifications from "~/server/qualifications";
 import { emailStatus, sendPasswordResetEmail } from "~/server/email";
@@ -146,7 +147,10 @@ function parseKit(raw: string | null): Kit | null {
   }
 }
 
-function summarise(application: db.Application): ApplicationSummary {
+function summarise(
+  application: db.Application,
+  takenForwardAt: string | null = null
+): ApplicationSummary {
   const kit = parseKit(application.kit_json);
   return {
     id: application.id,
@@ -157,6 +161,7 @@ function summarise(application: db.Application): ApplicationSummary {
     hasKit: kit !== null,
     coverage: kit?.keywordMatch.coverage ?? null,
     missingCount: kit?.keywordMatch.missing.length ?? 0,
+    takenForwardAt,
   };
 }
 
@@ -191,6 +196,9 @@ export const signUp = createServerFn({ method: "POST" })
       db.deleteExpiredSessions();
       db.deleteExpiredResets();
       startSession(user.id);
+      // Funnel step 1 of 5 — the account really exists at this point, so this is
+      // the real thing, not a page view. A local id, a step name and a time.
+      recordStep(user.id, "signup");
       return { ok: true };
     } catch {
       return { ok: false, error: "Couldn't create the account. Try again in a moment." };
@@ -406,9 +414,11 @@ export const exportMyData = createServerFn({ method: "POST" }).handler(
       about:
         "This is every piece of information ApplyPilot holds about your account: your profile vault, " +
         "the extracted text of each file you uploaded, every job posting you saved, and every kit " +
-        "generated from them. Your uploaded files themselves are not embedded here — open your " +
-        "profile vault and download each original from there. Your password is not included: it is " +
-        "stored as a one-way hash, so it cannot be exported in a readable form.",
+        "generated from them. It also lists the funnel steps your account reached — a step name and " +
+        "a time for each, with nothing from your résumé, your postings or your answers in them, and " +
+        "whether you marked a kit as taken forward. Your uploaded files themselves are not embedded " +
+        "here — open your profile vault and download each original from there. Your password is not " +
+        "included: it is stored as a one-way hash, so it cannot be exported in a readable form.",
       ...data,
     };
     return {
@@ -717,6 +727,9 @@ export const saveProfile = createServerFn({ method: "POST" })
     if (!profile.full_name.trim()) return { ok: false, error: "Add your full name — it goes on every document." };
     try {
       db.saveProfile(user.id, profile);
+      // Funnel step 2 of 5 — evaluated on the vault as it now stands, so it fires
+      // on the first save that got the profile far enough (see src/server/funnel.ts).
+      noteProfileMaterial(user.id);
       return { ok: true };
     } catch {
       return { ok: false, error: "Couldn't save your profile. Try again." };
@@ -872,6 +885,10 @@ export const uploadMaterial = createServerFn({ method: "POST" })
           extractNote: outcome.note,
           extractedText: outcome.text,
         });
+        // A résumé upload can be the moment the vault becomes enough to build an
+        // application from, so the step is evaluated here too — at the upload that
+        // did it, not at some later page view.
+        if (isResume && usableText) noteProfileMaterial(user.id);
         return { ok: true, material: summariseMaterial(material), resumeText, replacedResumeText };
       } catch {
         try {
@@ -941,6 +958,9 @@ export const useMaterialAsResume = createServerFn({ method: "POST" })
     }
     const profile = db.getProfile(user.id);
     db.saveProfile(user.id, { ...profile, resume_text: material.extracted_text });
+    // Adopting a stored material as the résumé can also be the moment the vault
+    // becomes enough to build from.
+    noteProfileMaterial(user.id);
     return { ok: true, resumeText: material.extracted_text };
   });
 
@@ -1018,6 +1038,10 @@ export const createApplication = createServerFn({ method: "POST" })
 
     const kit = generateKit({ profile: db.getProfile(user.id), application });
     db.saveKit(user.id, application.id, JSON.stringify(kit));
+    // Funnel steps 3 and 4 of 5 — the posting is saved and a kit exists for it,
+    // both because of this action and nothing else.
+    recordStep(user.id, "posting_added");
+    recordStep(user.id, "kit_generated");
     return { ok: true, id: application.id };
   });
 
@@ -1025,7 +1049,15 @@ export const listApplications = createServerFn({ method: "POST" }).handler(
   async (): Promise<Result<{ items: ApplicationSummary[] }>> => {
     const user = currentUser();
     if (!user) return { ok: false, error: NOT_SIGNED_IN };
-    return { ok: true, items: db.listApplications(user.id).map(summarise) };
+    const choices = new Map(
+      db.listApplicationChoices(user.id).map((choice) => [choice.application_id, choice.chosen_at])
+    );
+    return {
+      ok: true,
+      items: db
+        .listApplications(user.id)
+        .map((application) => summarise(application, choices.get(application.id) ?? null)),
+    };
   }
 );
 
@@ -1036,7 +1068,15 @@ export const loadApplication = createServerFn({ method: "POST" })
       data,
     }): Promise<
       Result<{
-        application: { id: string; title: string; company: string; url: string; createdAt: string };
+        application: {
+          id: string;
+          title: string;
+          company: string;
+          url: string;
+          createdAt: string;
+          /** Set when this account marked this kit as the one it is taking forward. */
+          takenForwardAt: string | null;
+        };
         kit: Kit | null;
       }>
     > => {
@@ -1052,6 +1092,7 @@ export const loadApplication = createServerFn({ method: "POST" })
           company: application.company,
           url: application.url,
           createdAt: application.created_at,
+          takenForwardAt: db.getApplicationChoice(user.id, application.id)?.chosen_at ?? null,
         },
         kit: parseKit(application.kit_json),
       };
@@ -1083,7 +1124,38 @@ export const regenerateKit = createServerFn({ method: "POST" })
     if (!updated) return { ok: false, error: "That application isn't in your account." };
     const kit = generateKit({ profile: db.getProfile(user.id), application: updated });
     db.saveKit(user.id, application.id, JSON.stringify(kit));
+    // Still step 4 of 5: rebuilding a kit does not add a second event.
+    recordStep(user.id, "kit_generated");
     return { ok: true, kit };
+  });
+
+/**
+ * Takes one kit forward: the user's own choice of the application they are
+ * carrying to the employer's real form themselves. This is the closest thing to
+ * "apply" that exists in this product — ApplyPilot still does not submit
+ * anything, and no submit path is added here.
+ *
+ * It is recorded once per account for the funnel (the first one taken forward);
+ * the choice itself can be moved to a different kit at any time.
+ */
+export const takeApplicationForward = createServerFn({ method: "POST" })
+  .validator((input: { id?: string }) => input)
+  .handler(async ({ data }): Promise<Result<{ chosenAt: string }>> => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    const application = db.getApplication(user.id, str(data?.id, 100));
+    if (!application) return { ok: false, error: "That application isn't in your account." };
+    if (!application.kit_json) {
+      return {
+        ok: false,
+        error: "There's no kit for that posting yet — rebuild it from your profile first.",
+      };
+    }
+    const isNew = db.saveApplicationChoice(user.id, application.id);
+    // Funnel step 5 of 5 — once per account, the first time a kit is taken forward.
+    if (isNew) recordStep(user.id, "application_taken_forward");
+    const choice = db.getApplicationChoice(user.id, application.id);
+    return { ok: true, chosenAt: choice?.chosen_at ?? db.nowIso() };
   });
 
 export const deleteApplication = createServerFn({ method: "POST" })

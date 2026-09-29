@@ -15,7 +15,7 @@ export const Route = createFileRoute("/privacy")({
   component: PrivacyPage,
 });
 
-const UPDATED = "26 September 2026";
+const UPDATED = "29 September 2026";
 
 function PrivacyPage() {
   return (
@@ -46,7 +46,7 @@ function PrivacyPage() {
             "Nobody but you can see it through the app. There is no sharing, no public profile, and no employer access.",
             "We never submit anything to an employer. ApplyPilot has no submit button and no code path that sends an application anywhere.",
             "You can download everything as one file, and you can delete your whole account and its files yourself, from the Account page, at any time.",
-            "There is no advertising, no tracking pixel, no analytics script, and no AI service reading your data.",
+            "There is no advertising, no tracking pixel, no third-party analytics script, and no AI service reading your data. ApplyPilot does keep its own count of five steps your account reaches — see 'The five steps we count' below — and it holds no content of yours.",
           ]}
         />
       </Section>
@@ -95,6 +95,23 @@ function PrivacyPage() {
             </>,
           ]}
         />
+      </Section>
+
+      <Section title="The five steps we count">
+        <p>
+          To see where people get through the product and where they stop, ApplyPilot records five steps
+          per account, and only these five: that an account was created; that the profile vault was
+          saved with enough to build an application from; that a job posting was saved; that a kit was
+          generated for one; and that the user marked one kit as the one they are taking forward.
+        </p>
+        <p>
+          Each step is a local user id, the step name, and the time — nothing else. No résumé text, no
+          posting text, no drafted answer, no employer or company name, no email address, no phone
+          number, no IP address and no browser string. It is written into ApplyPilot&apos;s own database
+          and goes nowhere else: there is no third-party analytics script, no external endpoint and no
+          extra cookie. A step is recorded when you actually do the thing and never again, so a repeated
+          save cannot inflate it, and asking for a page on its own never records anything.
+        </p>
       </Section>
 
       <Section title="What we do not do">
@@ -152,10 +169,11 @@ function PrivacyPage() {
             Account page
           </Link>{" "}
           has a <strong>Download my data</strong> button. It produces one JSON file with your profile
-          vault, the extracted text of every upload, every job posting and every kit. Your original
-          uploaded files are not embedded in that file — download each one from your profile vault. Your
-          password cannot be exported, because it is stored as a one-way hash and nobody, including us,
-          can read it back.
+          vault, the extracted text of every upload, every job posting and every kit, which kit you marked
+          as taken forward, and the five steps your account reached (each as a step name and a time). Your
+          original uploaded files are not embedded in that file — download each one from your profile
+          vault. Your password cannot be exported, because it is stored as a one-way hash and nobody,
+          including us, can read it back.
         </p>
       </Section>
 
@@ -167,7 +185,9 @@ function PrivacyPage() {
           </Link>{" "}
           has a <strong>Delete my account</strong> button. Enter your password and type DELETE, and the
           account row, your profile, every application and kit, every session and every reset link go,
-          along with your uploaded files from disk. It is immediate and there is no undo.
+          along with your uploaded files from disk. The funnel steps recorded for your account and any
+          kit you marked as taken forward are deleted with it — nothing about you is kept back for our
+          own counting. It is immediate and there is no undo.
         </p>
         <p className="rounded-xl border border-slate-200 bg-slate-50 p-4">
           <strong>The honest exception:</strong> a deleted account may still exist inside a backup taken

@@ -82,6 +82,8 @@ export type ApplicationSummary = {
   hasKit: boolean;
   coverage: number | null;
   missingCount: number;
+  /** When the user marked this kit as the one they are taking forward, if they did. */
+  takenForwardAt: string | null;
 };
 
 export type ProfileFormValues = {

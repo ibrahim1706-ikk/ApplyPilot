@@ -79,6 +79,7 @@ function ApplicationsPage() {
                         <Badge>No kit yet</Badge>
                       )}
                       {item.missingCount > 0 ? <Badge tone="amber">{item.missingCount} gaps</Badge> : null}
+                      {item.takenForwardAt ? <Badge tone="green">Taken forward</Badge> : null}
                       <span className="text-sm font-medium text-indigo-600">Open kit →</span>
                     </div>
                   </div>

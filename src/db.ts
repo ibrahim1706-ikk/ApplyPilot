@@ -299,6 +299,42 @@ CREATE TABLE IF NOT EXISTS qualification_decisions (
   confirmations_json TEXT NOT NULL DEFAULT '{}',
   updated_at         TEXT NOT NULL
 );
+
+-- Funnel instrumentation: which of the five steps an account has reached, so we
+-- can see where people stop instead of guessing. Deliberately the smallest table
+-- in the store — a local user id, the step name, and when it happened:
+--
+--   (id, user_id, name, created_at)   and nothing else.
+--
+-- No step ever carries user content: no résumé or posting text, no answer, no
+-- company or employer name, no email/name/phone, no IP address, no user agent.
+-- First-party only: these rows go in this database and nowhere else — no
+-- third-party analytics script, no external endpoint, no extra cookie.
+--
+-- One row per (account, step): the step is recorded the first time the user
+-- really does the thing and never again, so the table reads directly as a funnel
+-- (count rows per step = people who got that far). UNIQUE(user_id, name) is what
+-- makes that true even if two requests race.
+CREATE TABLE IF NOT EXISTS funnel_events (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL,
+  name       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (user_id, name)
+);
+CREATE INDEX IF NOT EXISTS funnel_events_name_idx ON funnel_events(name, created_at);
+
+-- The one application the user has chosen to take forward. This is the closest
+-- thing to "apply" that exists: it marks the kit the user is carrying to the real
+-- application form themselves. It is NOT a submit path — nothing is ever sent to
+-- an employer from here — and the two-a-day cap is not enforced yet, because
+-- nothing is submitted yet.
+CREATE TABLE IF NOT EXISTS application_choices (
+  user_id        TEXT NOT NULL,
+  application_id TEXT NOT NULL,
+  chosen_at      TEXT NOT NULL,
+  PRIMARY KEY (user_id, application_id)
+);
 `;
 
 // ---------------------------------------------------------------- connection ---
@@ -622,6 +658,9 @@ export function updateApplicationDetails(
 
 export function deleteApplication(userId: string, id: string): void {
   run("DELETE FROM applications WHERE id = ? AND user_id = ?", [id, userId]);
+  // The taken-forward mark belongs to this application, so it goes with it. The
+  // funnel step stays: it records that the user got there, which is still true.
+  run("DELETE FROM application_choices WHERE user_id = ? AND application_id = ?", [userId, id]);
 }
 
 /** Test/diagnostic only: proves the file-backed database is reachable. */
@@ -871,6 +910,180 @@ export function saveQualificationDecisions(
 export function deleteQualificationDecisions(userId: string): void {
   run("DELETE FROM qualification_decisions WHERE user_id = ?", [userId]);
 }
+// ------------------------------------------------------------ funnel events ---
+//
+// The five steps, in the order a person walks them. This list is the whole
+// vocabulary: `recordFunnelEvent` accepts nothing outside it, so a stray call
+// cannot invent a sixth step, and the check script proves the recorded set is
+// exactly these five.
+export const FUNNEL_STEPS = [
+  "signup",
+  "profile_complete",
+  "posting_added",
+  "kit_generated",
+  "application_taken_forward",
+] as const;
+
+export type FunnelEventName = (typeof FUNNEL_STEPS)[number];
+
+/** Who, what, when — the entire shape of a funnel row. No content, ever. */
+export type FunnelEvent = {
+  id: string;
+  user_id: string;
+  name: FunnelEventName;
+  created_at: string;
+};
+
+export function isFunnelStep(value: unknown): value is FunnelEventName {
+  return typeof value === "string" && (FUNNEL_STEPS as readonly string[]).includes(value);
+}
+
+/**
+ * Oldest first, and — for two steps recorded in the same millisecond, which is
+ * the normal case for a posting and its kit — in the order the funnel is walked.
+ * Without that tie-break the order within a millisecond would be alphabetical,
+ * which is not a thing the user did.
+ */
+function inWalkOrder(rows: FunnelEvent[]): FunnelEvent[] {
+  return rows
+    .slice()
+    .sort((a, b) =>
+      a.created_at === b.created_at
+        ? FUNNEL_STEPS.indexOf(a.name) - FUNNEL_STEPS.indexOf(b.name)
+        : a.created_at < b.created_at
+          ? -1
+          : 1
+    );
+}
+
+/**
+ * Records that this account has reached this step, and reports whether it was
+ * new. Written once per account and step: the UNIQUE(user_id, name) index is the
+ * real guard, and this read-then-insert inside one transaction is what turns a
+ * repeated action (saving the vault a second time, adding a second posting)
+ * into no second row.
+ *
+ * The caller must be the real action, never a page render — see the check script,
+ * which proves reading a page writes nothing.
+ */
+export function recordFunnelEvent(userId: string, name: FunnelEventName): boolean {
+  return db().transaction(() => {
+    const existing = one<{ id: string }>(
+      "SELECT id FROM funnel_events WHERE user_id = ? AND name = ?",
+      [userId, name]
+    );
+    if (existing) return false;
+    run("INSERT INTO funnel_events (id, user_id, name, created_at) VALUES (?, ?, ?, ?)", [
+      newId(),
+      userId,
+      name,
+      nowIso(),
+    ]);
+    return true;
+  })();
+}
+
+/** This account's own steps, oldest first — what the account holder did, no more. */
+export function getFunnelEvents(userId: string): FunnelEvent[] {
+  return inWalkOrder(
+    all<FunnelEvent>(
+      "SELECT id, user_id, name, created_at FROM funnel_events WHERE user_id = ? ORDER BY created_at ASC",
+      [userId]
+    )
+  );
+}
+
+/** One step for one account, or null — used to answer "has this already happened?". */
+export function getFunnelEvent(userId: string, name: FunnelEventName): FunnelEvent | null {
+  return one<FunnelEvent>(
+    "SELECT id, user_id, name, created_at FROM funnel_events WHERE user_id = ? AND name = ?",
+    [userId, name]
+  );
+}
+
+/**
+ * Every step in the store, for reading the funnel back. Diagnostic/operator use
+ * (the check script and any later funnel view) — it hands back ids and step names
+ * only, because that is all the table holds.
+ */
+export function listAllFunnelEvents(limit = 1000): FunnelEvent[] {
+  return inWalkOrder(
+    all<FunnelEvent>(
+      "SELECT id, user_id, name, created_at FROM funnel_events ORDER BY created_at ASC LIMIT ?",
+      [limit]
+    )
+  );
+}
+
+/** How many accounts reached each step — the funnel itself. */
+export function funnelSummary(): Array<{ name: FunnelEventName; accounts: number }> {
+  const counts = new Map<string, number>();
+  for (const row of all<{ name: string; n: number }>(
+    "SELECT name, COUNT(DISTINCT user_id) AS n FROM funnel_events GROUP BY name"
+  )) {
+    counts.set(row.name, row.n);
+  }
+  return FUNNEL_STEPS.map((name) => ({ name, accounts: counts.get(name) ?? 0 }));
+}
+
+/**
+ * The columns the funnel table actually has, read from the engine rather than
+ * from this file. The check script uses this to prove no content column has crept
+ * in: `(id, user_id, name, created_at)` is the entire list.
+ */
+export function funnelEventColumns(): string[] {
+  const rows = db().query("PRAGMA table_info(funnel_events)").all() as Array<{ name: unknown }>;
+  return rows.map((row) => String(row.name));
+}
+
+/** Total rows in the funnel table — tooling only. */
+export function funnelEventCount(): number {
+  return one<{ n: number }>("SELECT COUNT(*) AS n FROM funnel_events")?.n ?? 0;
+}
+
+// ------------------------------------------- the application taken forward ---
+
+export type ApplicationChoice = {
+  user_id: string;
+  application_id: string;
+  chosen_at: string;
+};
+
+/**
+ * Marks one of the account's own applications as the one being taken forward,
+ * and reports whether that was a new choice. Idempotent: taking the same kit
+ * forward twice changes nothing and records nothing new.
+ */
+export function saveApplicationChoice(userId: string, applicationId: string): boolean {
+  return db().transaction(() => {
+    const existing = one<{ chosen_at: string }>(
+      "SELECT chosen_at FROM application_choices WHERE user_id = ? AND application_id = ?",
+      [userId, applicationId]
+    );
+    if (existing) return false;
+    run("INSERT INTO application_choices (user_id, application_id, chosen_at) VALUES (?, ?, ?)", [
+      userId,
+      applicationId,
+      nowIso(),
+    ]);
+    return true;
+  })();
+}
+
+export function getApplicationChoice(userId: string, applicationId: string): ApplicationChoice | null {
+  return one<ApplicationChoice>(
+    "SELECT user_id, application_id, chosen_at FROM application_choices WHERE user_id = ? AND application_id = ?",
+    [userId, applicationId]
+  );
+}
+
+export function listApplicationChoices(userId: string): ApplicationChoice[] {
+  return all<ApplicationChoice>(
+    "SELECT user_id, application_id, chosen_at FROM application_choices WHERE user_id = ? ORDER BY chosen_at ASC",
+    [userId]
+  );
+}
+
 // --------------------------------------------------------- deleting an account ---
 //
 // One function, one transaction, every table that holds anything about the
@@ -890,6 +1103,10 @@ export type DeletedAccount = {
   qualifications: number;
   /** The user's own fact decisions and confirmations, if they had any. */
   qualificationDecisions: number;
+  /** Funnel steps recorded for this account — they are deleted with it. */
+  funnelEvents: number;
+  /** Applications this account had marked as taken forward. */
+  applicationChoices: number;
   /** Stored paths of the user's uploaded originals, relative to `uploadsRoot()`/userId. */
   materialPaths: string[];
 };
@@ -913,6 +1130,8 @@ export function deleteAccount(userId: string): DeletedAccount | null {
     resets: counts("SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?"),
     qualifications: counts("SELECT COUNT(*) AS n FROM qualifications WHERE user_id = ?"),
     qualificationDecisions: counts("SELECT COUNT(*) AS n FROM qualification_decisions WHERE user_id = ?"),
+    funnelEvents: counts("SELECT COUNT(*) AS n FROM funnel_events WHERE user_id = ?"),
+    applicationChoices: counts("SELECT COUNT(*) AS n FROM application_choices WHERE user_id = ?"),
     rateEvents: 0,
     materialPaths: materials.map((m) => m.stored_path),
   };
@@ -925,6 +1144,11 @@ export function deleteAccount(userId: string): DeletedAccount | null {
     run("DELETE FROM password_resets WHERE user_id = ?", [userId]);
     run("DELETE FROM qualifications WHERE user_id = ?", [userId]);
     run("DELETE FROM qualification_decisions WHERE user_id = ?", [userId]);
+    // The funnel steps and the taken-forward choice go with the account. Nothing
+    // about a deleted person is kept for our own counting: the promise is
+    // "we do not keep a copy after you delete your account", and it holds here too.
+    run("DELETE FROM funnel_events WHERE user_id = ?", [userId]);
+    run("DELETE FROM application_choices WHERE user_id = ?", [userId]);
     run("DELETE FROM users WHERE id = ?", [userId]);
   })();
 
@@ -945,6 +1169,11 @@ export function countRowsForUser(userId: string): Record<string, number> {
     qualifications: count("SELECT COUNT(*) AS n FROM qualifications WHERE user_id = ?", [userId]),
     qualification_decisions: count(
       "SELECT COUNT(*) AS n FROM qualification_decisions WHERE user_id = ?",
+      [userId]
+    ),
+    funnel_events: count("SELECT COUNT(*) AS n FROM funnel_events WHERE user_id = ?", [userId]),
+    application_choices: count(
+      "SELECT COUNT(*) AS n FROM application_choices WHERE user_id = ?",
       [userId]
     ),
   };
@@ -972,6 +1201,8 @@ export type AccountExport = {
     url: string;
     postingText: string;
     kit: unknown;
+    /** When this account marked this kit as the one being taken forward, if it did. */
+    takenForwardAt: string | null;
     createdAt: string;
     updatedAt: string;
   }>;
@@ -986,6 +1217,16 @@ export type AccountExport = {
     confirmations: unknown;
     decisionsUpdatedAt: string | null;
   } | null;
+  /**
+   * The funnel steps this account reached, and when. These are counts of a local
+   * id and a step name — there is no user content in them — so they belong in the
+   * export just as much as anything else the account built up, and leaving them
+   * out would make the export's own promise ("everything ApplyPilot holds about
+   * your account") untrue.
+   */
+  funnel: {
+    events: Array<{ step: FunnelEventName; at: string }>;
+  };
 };
 
 /**
@@ -995,6 +1236,9 @@ export type AccountExport = {
 export function exportAccount(userId: string): AccountExport | null {
   const user = one<User>("SELECT id, email, created_at FROM users WHERE id = ?", [userId]);
   if (!user) return null;
+  const choices = new Map(
+    listApplicationChoices(userId).map((choice) => [choice.application_id, choice.chosen_at])
+  );
   return {
     account: { email: user.email, createdAt: user.created_at },
     profile: getProfile(userId),
@@ -1015,10 +1259,14 @@ export function exportAccount(userId: string): AccountExport | null {
       url: application.url,
       postingText: application.posting_text,
       kit: parseUnknownJson(application.kit_json),
+      takenForwardAt: choices.get(application.id) ?? null,
       createdAt: application.created_at,
       updatedAt: application.updated_at,
     })),
     qualifications: readQualificationsForExport(userId),
+    funnel: {
+      events: getFunnelEvents(userId).map((event) => ({ step: event.name, at: event.created_at })),
+    },
   };
 }
 /** The stored fact set, as plain data, for the account export. */
@@ -1060,6 +1308,8 @@ export function tableCounts(): Record<string, number> {
     "password_resets",
     "qualifications",
     "qualification_decisions",
+    "funnel_events",
+    "application_choices",
   ];
   const out: Record<string, number> = {};
   for (const name of names) {
