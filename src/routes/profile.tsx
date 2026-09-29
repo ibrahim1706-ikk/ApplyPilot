@@ -119,7 +119,7 @@ function ProfileForm({
         </div>
       </div>
 
-      <Card>
+      <Card id="about-you">
         <SectionTitle hint="These are the details every application form asks for.">About you</SectionTitle>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Full name">
@@ -137,7 +137,7 @@ function ProfileForm({
         </div>
       </Card>
 
-      <Card>
+      <Card id="links">
         <SectionTitle hint="Any of these you have — they're added to your cover letter links.">Links</SectionTitle>
         <div className="grid gap-4 sm:grid-cols-3">
           <Field label="Portfolio site">
@@ -319,7 +319,7 @@ function ProfileForm({
               placeholder="Choose your situation"
             />
           </Field>
-          <Field label="Work authorisation note" hint="Optional — e.g. visa expiry, or “unrestricted hours”.">
+          <Field id="work-authorisation-note" label="Work authorisation note" hint="Optional — e.g. visa expiry, or “unrestricted hours”.">
             <Input
               value={form.work_authorisation_note}
               onChange={(v) => patch({ work_authorisation_note: v })}

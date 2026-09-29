@@ -239,7 +239,7 @@ export const FACT_CATEGORY_COPY: Record<
 > = {
   identity: {
     title: "Who you are",
-    hint: "The contact details every application form asks for.",
+    hint: "The contact details every application form asks for, plus your notice period and salary expectation from the vault.",
     empty: "We couldn't find any contact details — add your name and email in the profile vault.",
     addLabel: "Add a detail",
   },
@@ -587,3 +587,220 @@ export const HUMAN_MAX_SIZE = "5 MB";
 export const SUPPORTED_FORMATS_COPY = "PDF, Word .docx, .txt or .md, up to 5 MB";
 export const UPLOAD_ACCEPT_ATTRIBUTE =
   ".pdf,.docx,.txt,.md,.markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown";
+
+// -------------------------------------------------- answering a real form ---
+//
+// Stage 3. A job application asks for a fixed set of things; this is the list we
+// answer, and the shape an answer comes back in. The engine itself
+// (`src/server/field-answers.ts`) is server-only; these types and the copy below
+// are client-safe so the screen can render an answer without ever reaching for
+// the storage module.
+//
+// The rules the engine holds to, stated here because the screen's copy repeats
+// them to the user:
+//   - an answer is built ONLY from a fact the user has confirmed;
+//   - every answer carries the fact it came from, and the résumé line or vault
+//     field behind that fact, in the same words the review screen uses;
+//   - a fact the user has not confirmed is named as pending and never used;
+//   - where nothing covers a field, the honest answer is "not covered" plus a
+//     pointer to the exact place the real detail belongs. There is no default,
+//     no interpolation between facts, and nothing filled in to look complete.
+//
+// Nothing here is ever submitted: the app has no submit path.
+
+/** The application fields this layer answers. One per real form question. */
+export type AnswerFieldKey =
+  | "full_name"
+  | "email"
+  | "phone"
+  | "location"
+  | "portfolio"
+  | "github"
+  | "linkedin"
+  | "work_rights"
+  | "sponsorship"
+  | "notice_period"
+  | "salary_expectation"
+  | "current_role"
+  | "years_experience"
+  | "education"
+  | "skills"
+  | "certifications"
+  | "languages";
+
+export type AnswerGroup = "identity" | "arrangements" | "experience" | "qualifications";
+
+/** Display copy for each group of fields, in the order they are shown. */
+export const ANSWER_GROUP_COPY: Record<AnswerGroup, { title: string; hint: string }> = {
+  identity: {
+    title: "Who you are",
+    hint: "The details nearly every application form opens with. Nothing here is completed for you — each one comes from a fact you confirmed.",
+  },
+  arrangements: {
+    title: "Working arrangements",
+    hint: "Work rights, sponsorship, notice and pay — the questions that decide whether an application can go ahead. Your own wording is used, never a standard answer.",
+  },
+  experience: {
+    title: "Your experience",
+    hint: "What your material says about your most recent role, and only the numbers your material actually states.",
+  },
+  qualifications: {
+    title: "Qualifications, skills and languages",
+    hint: "Every entry here is quoted as your material has it. We don't rank, summarise or upgrade anything.",
+  },
+};
+
+/**
+ * What a real form asks, per field, and which group it belongs to. The engine
+ * fills the answer; the order below is the order the screen shows.
+ */
+export const ANSWER_FIELD_SPECS: Array<{
+  key: AnswerFieldKey;
+  group: AnswerGroup;
+  question: string;
+  hint: string;
+}> = [
+  { key: "full_name", group: "identity", question: "First and last name", hint: "As your material spells it." },
+  { key: "email", group: "identity", question: "Email address", hint: "The one you gave us." },
+  { key: "phone", group: "identity", question: "Phone number", hint: "Digits exactly as your material has them." },
+  { key: "location", group: "identity", question: "Where you are based", hint: "City and country, from your vault." },
+  { key: "portfolio", group: "identity", question: "Portfolio or personal website", hint: "Only if you have one saved." },
+  { key: "github", group: "identity", question: "GitHub", hint: "Only if you have one saved." },
+  { key: "linkedin", group: "identity", question: "LinkedIn", hint: "Only if you have one saved." },
+  {
+    key: "work_rights",
+    group: "arrangements",
+    question: "Are you authorised to work here? / what is your visa status?",
+    hint: "Your own statement about your work rights.",
+  },
+  {
+    key: "sponsorship",
+    group: "arrangements",
+    question: "Will you now or in the future need sponsorship?",
+    hint: "Only answered from a work-rights answer that plainly settles it.",
+  },
+  { key: "notice_period", group: "arrangements", question: "Notice period / how soon could you start?", hint: "Your own wording." },
+  { key: "salary_expectation", group: "arrangements", question: "Salary expectation", hint: "Your own wording, never a range we pick." },
+  {
+    key: "current_role",
+    group: "experience",
+    question: "Current or most recent job title and employer",
+    hint: "The most recent role in your material, quoted as it stands.",
+  },
+  {
+    key: "years_experience",
+    group: "experience",
+    question: "How many years of experience do you have?",
+    hint: "Only when your material states a number itself — we never do the arithmetic for you.",
+  },
+  { key: "education", group: "qualifications", question: "Education / highest qualification", hint: "Every qualification your material states." },
+  { key: "skills", group: "qualifications", question: "Skills and tools", hint: "The skills your material lists, in your own words." },
+  { key: "certifications", group: "qualifications", question: "Certifications and licences", hint: "Only the ones your material states." },
+  { key: "languages", group: "qualifications", question: "Languages", hint: "With the level your material gives, if it gives one." },
+];
+
+/** Which group a field belongs to, for grouping the answers on the screen. */
+export function answerGroupOf(field: AnswerFieldKey): AnswerGroup {
+  return ANSWER_FIELD_SPECS.find((spec) => spec.key === field)?.group ?? "identity";
+}
+
+/**
+ * `answered` — at least one confirmed fact covers it, and the answer is built
+ * from those facts alone.
+ * `pending` — the material covers it, but nothing the user has confirmed does.
+ * The answer is WITHHELD (empty) and the fact is named as pending.
+ * `not-covered` — nothing in the material covers it. "not covered" is shown
+ * with a pointer to where the real detail goes.
+ */
+export type FieldAnswerStatus = "answered" | "pending" | "not-covered";
+
+/** One fact an answer was built from, with the line or field behind it. */
+export type AnswerSource = {
+  /** The fact's id — the same id the review screen lists it under. */
+  factId: string;
+  category: FactCategory;
+  /** The fact's own short label, e.g. "Email", "Skill", "Role". */
+  factLabel: string;
+  /** The fact's display text, exactly as it stands (the user's wording if edited). */
+  factValue: string;
+  /** The structured parts of the fact, e.g. a role's title, company and dates. */
+  fields: Record<string, string>;
+  /** The résumé line or vault field value the fact was read from. */
+  quote: string;
+  /** Where that came from, in the review screen's own words. */
+  provenance: string;
+  /** The caveat the fact already carries, if any — shown, never hidden. */
+  note: string;
+  /** True when the line behind the fact is no longer in the user's material. */
+  sourceGone: boolean;
+};
+
+/** Where to add the real detail for a field nothing covers. */
+export type FieldAnswerNudge = {
+  /** Plain statement of what is missing. */
+  text: string;
+  /** What to do about it, in one short instruction. */
+  action: string;
+  /** Which surface holds the place to add it. */
+  where: "profile" | "qualifications";
+  /** Element id to land on, so the link drops the user at the right place. */
+  hash: string;
+};
+
+export type FieldAnswer = {
+  field: AnswerFieldKey;
+  group: AnswerGroup;
+  /** The question as a real form asks it. */
+  question: string;
+  hint: string;
+  status: FieldAnswerStatus;
+  /** The answer text. Empty unless the status is "answered" — never a default. */
+  answer: string;
+  /** The facts the answer was built from. Never empty when answered. */
+  sources: AnswerSource[];
+  /**
+   * Confirmed facts that say something else about this field, quoted beside the
+   * answer rather than folded into it. The answer is never a blend of the two:
+   * where a form wants one answer, the user's own chosen statement is it, and
+   * anything else their material says is shown, not merged.
+   */
+  related: AnswerSource[];
+  /** Facts that cover this field that the user has NOT confirmed. Never used. */
+  pending: AnswerSource[];
+  /** Facts the user excluded that would otherwise have covered this field. */
+  excluded: AnswerSource[];
+  /** Honest statement of what isn't covered. Empty when answered. */
+  notCovered: string;
+  /** The "not confirmed yet" sentence. Empty unless something is pending. */
+  pendingNote: string;
+  /** A caveat about how the answer was put together, e.g. we don't rank degrees. */
+  caveat: string;
+  /** Where to add what's missing. Null when the field is answered. */
+  nudge: FieldAnswerNudge | null;
+};
+
+export type FieldAnswers = {
+  answers: FieldAnswer[];
+  answered: number;
+  pending: number;
+  notCovered: number;
+  /** Facts the user confirmed — the only ones any answer can come from. */
+  confirmedCount: number;
+  /** Facts in the set at all: confirmed, still to confirm, and excluded. */
+  factCount: number;
+  /** True when no fact is confirmed yet: the honest empty state. */
+  empty: boolean;
+  emptyCopy: string;
+  /** Things worth telling the user about this set of answers. */
+  notes: string[];
+};
+
+/** Shown wherever a fact covers a field but the user hasn't confirmed it yet. */
+export const PENDING_FACT_COPY = "not confirmed yet — review it here";
+
+/** The lead-in on a field nothing in the confirmed set covers. */
+export const NOT_COVERED_COPY = "not covered";
+
+/** The nudge sentence used when the user excluded the fact that would have answered. */
+export const EXCLUDED_FACT_COPY =
+  "You excluded the fact we found for this, so it isn't used here — nothing is put back without you.";

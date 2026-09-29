@@ -13,6 +13,7 @@ import { join } from "node:path";
 import * as db from "~/db";
 import { currentUser, endSession, startSession } from "~/server/auth";
 import { fetchPostingText, normalisePostingUrl } from "~/server/fetch-posting";
+import { fieldAnswersFor } from "~/server/field-answers";
 import { generateKit, readPostingHints } from "~/server/generate";
 import * as qualifications from "~/server/qualifications";
 import { emailStatus, sendPasswordResetEmail } from "~/server/email";
@@ -32,6 +33,7 @@ import type {
   Fact,
   FactCategory,
   FactConfirmations,
+  FieldAnswers,
   Kit,
   MaterialSummary,
   ProfileFormValues,
@@ -570,8 +572,36 @@ export const loadQualifications = createServerFn({ method: "POST" }).handler(
   }
 );
 
+/**
+ * STAGE 3: what this account would put in each standard field of a real
+ * application form, each answer carrying the fact it came from and the line or
+ * vault field behind that fact.
+ *
+ * Deterministic and offline: the answers come from the same fact set the review
+ * screen shows, with the user's decisions applied, and only facts the user has
+ * CONFIRMED are ever used. A fact that isn't confirmed yet is reported as
+ * pending instead; a field nothing covers comes back "not covered" with a
+ * pointer to where the real detail belongs. Nothing is written and nothing is
+ * sent — there is no submit path.
+ */
+export const loadFieldAnswers = createServerFn({ method: "POST" }).handler(
+  async (): Promise<Result<{ answers: FieldAnswers }>> => {
+    const user = currentUser();
+    if (!user) return { ok: false, error: NOT_SIGNED_IN };
+    try {
+      return { ok: true, answers: fieldAnswersFor(user.id) };
+    } catch (error) {
+      return {
+        ok: false,
+        error:
+          "We couldn't put your answers together just now. Nothing has been changed — try again in a moment." +
+          (error instanceof Error ? ` (${error.message})` : ""),
+      };
+    }
+  }
+);
+
 // --------------------------------------------------- reviewing the fact set ---
-//
 // Every one of these writes only what the user themselves decided. There is no
 // path here that changes a fact on the user's behalf, and none of them sends
 // anything anywhere: the app has no submit path at all.
