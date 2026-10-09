@@ -1,18 +1,35 @@
 /**
  * ApplyPilot data layer — the ONE module in this app that touches the database.
  *
- * Storage is a SQLite file (`data/applypilot.db`, next to site.json — gitignored)
- * opened with Bun's built-in `bun:sqlite`, so the app needs no external service
- * and no credentials. Every read/write in the product goes through the functions
- * exported here; nothing else imports `bun:sqlite` or writes SQL. That keeps the
- * swap to a managed Postgres a single-file change later: reimplement these
- * functions against `DATABASE_URL` and delete the SQLite bits.
+ * There are two stores, and `DATABASE_URL` picks between them:
+ *
+ *   DATABASE_URL set    → Postgres (Bun's built-in `Bun.sql`), reached from a
+ *                         worker thread so the functions below stay synchronous
+ *   DATABASE_URL unset  → a SQLite file (`data/applypilot.db`), opened with Bun's
+ *                         built-in `bun:sqlite`
+ *
+ * This is the fix for a real, observed data loss: the deployed folder is rebuilt
+ * on every publish, so a store that lives in it (or next to the shipped bundle)
+ * is wiped when we ship. A managed Postgres holds the data off that machine.
+ *
+ * The switch is deliberately absolute. When `DATABASE_URL` is set the app talks
+ * to it or it fails — it never falls back to the local file, because a silent
+ * fallback would look like it was saving a real user's data while actually
+ * writing to a store the next publish deletes. That failure mode is worse than
+ * an error, so it is designed out rather than handled.
+ *
+ * Every read/write in the product goes through the functions exported here;
+ * nothing else writes SQL, and no other module knows which store is in use. The
+ * exported signatures are identical either way — callers do not change.
  *
  * Only import this from server-only code (a `createServerFn()` handler). Never
  * from a component.
  */
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { MessageChannel, Worker, receiveMessageOnPort } from "node:worker_threads";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 
 // ---------------------------------------------------------------- site root ---
@@ -58,19 +75,82 @@ const SITE_ROOT = findSiteRoot();
  * empty database is the exact failure being fixed here, so it must never be the
  * fallback.
  */
-function defaultDataDir(): string {
-  return normalize(join(SITE_ROOT, "..", "..", ".data", "applypilot"));
-}
+/** Which store the app is talking to. Chosen once, from `DATABASE_URL`, at load. */
+export type StoreBackend = "sqlite" | "postgres";
 
 /** Where durable state lives (absolute), and how that path was chosen. */
 export type DataLocation = {
   dir: string;
+  /**
+   * What the store points at, safe to log: the absolute path of the SQLite file
+   * on the file backend, or the connection target with every credential removed
+   * on the managed one. Never a password.
+   */
   database: string;
   uploads: string;
   source: "APPLYPILOT_DATA_DIR" | "default";
   /** True when the store sits inside the published folder — a publish resets it. */
   insideSiteRoot: boolean;
+  /** Which engine is in use — `sqlite` unless `DATABASE_URL` says otherwise. */
+  backend: StoreBackend;
+  /** True when the backend came from `DATABASE_URL` rather than a local file. */
+  managed: boolean;
 };
+
+/**
+ * Reads `DATABASE_URL`. Absent or blank → the local SQLite file, exactly as
+ * before. Present → the managed Postgres, and then the only two outcomes are
+ * "connected" and "a loud error"; there is no third path back to the file.
+ *
+ * A URL that cannot be parsed is reported here rather than at the first query, so
+ * a mistyped secret shows up in the boot log instead of at somebody's signup.
+ */
+function readDatabaseUrl(): { url: string | null; problem: string | null } {
+  const raw = process.env.DATABASE_URL?.trim();
+  if (!raw) return { url: null, problem: null };
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return {
+      url: null,
+      problem:
+        "DATABASE_URL is set but is not a valid connection URL (it could not be parsed). " +
+        'A managed Postgres URL looks like "postgresql://user:password@host:5432/dbname".',
+    };
+  }
+  if (!/^postgres(ql)?:$/.test(parsed.protocol)) {
+    return {
+      url: null,
+      problem:
+        `DATABASE_URL is set but its scheme is "${parsed.protocol}" — this store speaks ` +
+        'Postgres only ("postgres://" or "postgresql://").',
+    };
+  }
+  if (!parsed.hostname || !parsed.pathname.replace(/^\/+/, "")) {
+    return { url: null, problem: "DATABASE_URL is set but names no host and/or no database." };
+  }
+  return { url: raw, problem: null };
+}
+
+/** The same URL with the user name and password removed — the only form we log. */
+function redactDatabaseUrl(raw: string): string {
+  try {
+    const parsed = new URL(raw);
+    const database = parsed.pathname.replace(/^\/+/, "");
+    const port = parsed.port ? `:${parsed.port}` : "";
+    const query = [...parsed.searchParams.keys()].length > 0 ? ` (params: ${[...parsed.searchParams.keys()].join(", ")})` : "";
+    return `postgres at ${parsed.hostname}${port}/${database}${query}`;
+  } catch {
+    return "postgres at an unreadable URL";
+  }
+}
+
+const DATABASE_URL = readDatabaseUrl();
+
+function defaultDataDir(): string {
+  return normalize(join(SITE_ROOT, "..", "..", ".data", "applypilot"));
+}
 
 function resolveDataDir(): DataLocation {
   const override = process.env.APPLYPILOT_DATA_DIR?.trim();
@@ -94,7 +174,18 @@ function resolveDataDir(): DataLocation {
   const database = process.env.APPLYPILOT_DB_PATH ?? join(dir, "applypilot.db");
   const uploads = process.env.APPLYPILOT_UPLOADS_PATH ?? join(dir, "uploads");
   const insideSiteRoot = dir === SITE_ROOT || dir.startsWith(SITE_ROOT + "/");
-  return { dir, database, uploads, source, insideSiteRoot };
+  const managed = DATABASE_URL.url !== null;
+  return {
+    dir,
+    // On the managed backend this field is the redacted connection target, not a
+    // file path — the boot log prints it, and a path there would be a lie.
+    database: managed ? redactDatabaseUrl(DATABASE_URL.url as string) : database,
+    uploads,
+    source,
+    insideSiteRoot,
+    backend: managed ? "postgres" : "sqlite",
+    managed,
+  };
 }
 
 const LOCATION = resolveDataDir();
