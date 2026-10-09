@@ -148,6 +148,18 @@ function redactDatabaseUrl(raw: string): string {
 
 const DATABASE_URL = readDatabaseUrl();
 
+// A set-but-unusable DATABASE_URL must stop the process, not fall back: an
+// unparseable URL or a non-Postgres scheme is still an instruction to use a
+// managed database, and quietly opening a local file instead would look like the
+// user's data was being saved while writing it to a store the next publish
+// deletes. Checked at load, so it is the first thing in the boot log.
+if (DATABASE_URL.problem) {
+  throw new Error(
+    `[applypilot] ${DATABASE_URL.problem} Refusing to start on the local file backend: ` +
+      "DATABASE_URL is set, so either it must reach a Postgres database or it must be removed."
+  );
+}
+
 function defaultDataDir(): string {
   return normalize(join(SITE_ROOT, "..", "..", ".data", "applypilot"));
 }
