@@ -1,18 +1,35 @@
 /**
  * ApplyPilot data layer — the ONE module in this app that touches the database.
  *
- * Storage is a SQLite file (`data/applypilot.db`, next to site.json — gitignored)
- * opened with Bun's built-in `bun:sqlite`, so the app needs no external service
- * and no credentials. Every read/write in the product goes through the functions
- * exported here; nothing else imports `bun:sqlite` or writes SQL. That keeps the
- * swap to a managed Postgres a single-file change later: reimplement these
- * functions against `DATABASE_URL` and delete the SQLite bits.
+ * There are two stores, and `DATABASE_URL` picks between them:
+ *
+ *   DATABASE_URL set    → Postgres (Bun's built-in `Bun.sql`), reached from a
+ *                         worker thread so the functions below stay synchronous
+ *   DATABASE_URL unset  → a SQLite file (`data/applypilot.db`), opened with Bun's
+ *                         built-in `bun:sqlite`
+ *
+ * This is the fix for a real, observed data loss: the deployed folder is rebuilt
+ * on every publish, so a store that lives in it (or next to the shipped bundle)
+ * is wiped when we ship. A managed Postgres holds the data off that machine.
+ *
+ * The switch is deliberately absolute. When `DATABASE_URL` is set the app talks
+ * to it or it fails — it never falls back to the local file, because a silent
+ * fallback would look like it was saving a real user's data while actually
+ * writing to a store the next publish deletes. That failure mode is worse than
+ * an error, so it is designed out rather than handled.
+ *
+ * Every read/write in the product goes through the functions exported here;
+ * nothing else writes SQL, and no other module knows which store is in use. The
+ * exported signatures are identical either way — callers do not change.
  *
  * Only import this from server-only code (a `createServerFn()` handler). Never
  * from a component.
  */
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { MessageChannel, Worker, receiveMessageOnPort } from "node:worker_threads";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 
 // ---------------------------------------------------------------- site root ---
@@ -58,19 +75,94 @@ const SITE_ROOT = findSiteRoot();
  * empty database is the exact failure being fixed here, so it must never be the
  * fallback.
  */
-function defaultDataDir(): string {
-  return normalize(join(SITE_ROOT, "..", "..", ".data", "applypilot"));
-}
+/** Which store the app is talking to. Chosen once, from `DATABASE_URL`, at load. */
+export type StoreBackend = "sqlite" | "postgres";
 
 /** Where durable state lives (absolute), and how that path was chosen. */
 export type DataLocation = {
   dir: string;
+  /**
+   * What the store points at, safe to log: the absolute path of the SQLite file
+   * on the file backend, or the connection target with every credential removed
+   * on the managed one. Never a password.
+   */
   database: string;
   uploads: string;
   source: "APPLYPILOT_DATA_DIR" | "default";
   /** True when the store sits inside the published folder — a publish resets it. */
   insideSiteRoot: boolean;
+  /** Which engine is in use — `sqlite` unless `DATABASE_URL` says otherwise. */
+  backend: StoreBackend;
+  /** True when the backend came from `DATABASE_URL` rather than a local file. */
+  managed: boolean;
 };
+
+/**
+ * Reads `DATABASE_URL`. Absent or blank → the local SQLite file, exactly as
+ * before. Present → the managed Postgres, and then the only two outcomes are
+ * "connected" and "a loud error"; there is no third path back to the file.
+ *
+ * A URL that cannot be parsed is reported here rather than at the first query, so
+ * a mistyped secret shows up in the boot log instead of at somebody's signup.
+ */
+function readDatabaseUrl(): { url: string | null; problem: string | null } {
+  const raw = process.env.DATABASE_URL?.trim();
+  if (!raw) return { url: null, problem: null };
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return {
+      url: null,
+      problem:
+        "DATABASE_URL is set but is not a valid connection URL (it could not be parsed). " +
+        'A managed Postgres URL looks like "postgresql://user:password@host:5432/dbname".',
+    };
+  }
+  if (!/^postgres(ql)?:$/.test(parsed.protocol)) {
+    return {
+      url: null,
+      problem:
+        `DATABASE_URL is set but its scheme is "${parsed.protocol}" — this store speaks ` +
+        'Postgres only ("postgres://" or "postgresql://").',
+    };
+  }
+  if (!parsed.hostname || !parsed.pathname.replace(/^\/+/, "")) {
+    return { url: null, problem: "DATABASE_URL is set but names no host and/or no database." };
+  }
+  return { url: raw, problem: null };
+}
+
+/** The same URL with the user name and password removed — the only form we log. */
+function redactDatabaseUrl(raw: string): string {
+  try {
+    const parsed = new URL(raw);
+    const database = parsed.pathname.replace(/^\/+/, "");
+    const port = parsed.port ? `:${parsed.port}` : "";
+    const query = [...parsed.searchParams.keys()].length > 0 ? ` (params: ${[...parsed.searchParams.keys()].join(", ")})` : "";
+    return `postgres at ${parsed.hostname}${port}/${database}${query}`;
+  } catch {
+    return "postgres at an unreadable URL";
+  }
+}
+
+const DATABASE_URL = readDatabaseUrl();
+
+// A set-but-unusable DATABASE_URL must stop the process, not fall back: an
+// unparseable URL or a non-Postgres scheme is still an instruction to use a
+// managed database, and quietly opening a local file instead would look like the
+// user's data was being saved while writing it to a store the next publish
+// deletes. Checked at load, so it is the first thing in the boot log.
+if (DATABASE_URL.problem) {
+  throw new Error(
+    `[applypilot] ${DATABASE_URL.problem} Refusing to start on the local file backend: ` +
+      "DATABASE_URL is set, so either it must reach a Postgres database or it must be removed."
+  );
+}
+
+function defaultDataDir(): string {
+  return normalize(join(SITE_ROOT, "..", "..", ".data", "applypilot"));
+}
 
 function resolveDataDir(): DataLocation {
   const override = process.env.APPLYPILOT_DATA_DIR?.trim();
@@ -94,7 +186,18 @@ function resolveDataDir(): DataLocation {
   const database = process.env.APPLYPILOT_DB_PATH ?? join(dir, "applypilot.db");
   const uploads = process.env.APPLYPILOT_UPLOADS_PATH ?? join(dir, "uploads");
   const insideSiteRoot = dir === SITE_ROOT || dir.startsWith(SITE_ROOT + "/");
-  return { dir, database, uploads, source, insideSiteRoot };
+  const managed = DATABASE_URL.url !== null;
+  return {
+    dir,
+    // On the managed backend this field is the redacted connection target, not a
+    // file path — the boot log prints it, and a path there would be a lie.
+    database: managed ? redactDatabaseUrl(DATABASE_URL.url as string) : database,
+    uploads,
+    source,
+    insideSiteRoot,
+    backend: managed ? "postgres" : "sqlite",
+    managed,
+  };
 }
 
 const LOCATION = resolveDataDir();
@@ -337,11 +440,445 @@ CREATE TABLE IF NOT EXISTS application_choices (
 );
 `;
 
-// ---------------------------------------------------------------- connection ---
+/**
+ * The same eleven tables on Postgres, column for column with the SQLite schema
+ * above: text stays text (including the ISO timestamps, which are compared as
+ * strings on both engines), integer stays integer — including the 0/1 flags,
+ * which are deliberately NOT `boolean` so the values the app reads back are the
+ * same numbers `bun:sqlite` hands it. Uniqueness, primary keys and defaults are
+ * carried over one-for-one. The only shape that had to change is the SQLite
+ * `INTEGER PRIMARY KEY AUTOINCREMENT` on `rate_events`, which Postgres spells
+ * `integer GENERATED BY DEFAULT AS IDENTITY` — nothing reads that id.
+ *
+ * `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` are idempotent on
+ * Postgres too, so an empty managed database is usable with no manual step: the
+ * schema is applied once, when the connection is first opened.
+ *
+ * NO CONNECTION STRING APPEARS HERE. Postgres-flavoured SQL lives only in this
+ * module; every other module goes through the exported functions.
+ */
+const POSTGRES_SCHEMA: string[] = [
+  `CREATE TABLE IF NOT EXISTS users (
+     id            text PRIMARY KEY,
+     email         text NOT NULL UNIQUE,
+     password_hash text NOT NULL,
+     created_at    text NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS sessions (
+     token_hash text PRIMARY KEY,
+     user_id    text NOT NULL,
+     created_at text NOT NULL,
+     expires_at text NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)`,
+  `CREATE TABLE IF NOT EXISTS profiles (
+     user_id                 text PRIMARY KEY,
+     full_name               text NOT NULL DEFAULT '',
+     email                   text NOT NULL DEFAULT '',
+     phone                   text NOT NULL DEFAULT '',
+     location                text NOT NULL DEFAULT '',
+     portfolio_url           text NOT NULL DEFAULT '',
+     github_url              text NOT NULL DEFAULT '',
+     linkedin_url            text NOT NULL DEFAULT '',
+     resume_text             text NOT NULL DEFAULT '',
+     education_json          text NOT NULL DEFAULT '[]',
+     experience_json         text NOT NULL DEFAULT '[]',
+     work_authorisation      text NOT NULL DEFAULT '',
+     work_authorisation_note text NOT NULL DEFAULT '',
+     salary_expectation      text NOT NULL DEFAULT '',
+     notice_period           text NOT NULL DEFAULT '',
+     updated_at              text NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS applications (
+     id           text PRIMARY KEY,
+     user_id      text NOT NULL,
+     title        text NOT NULL DEFAULT '',
+     company      text NOT NULL DEFAULT '',
+     url          text NOT NULL DEFAULT '',
+     posting_text text NOT NULL DEFAULT '',
+     kit_json     text,
+     created_at   text NOT NULL,
+     updated_at   text NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS applications_user_idx ON applications(user_id, created_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS materials (
+     id             text PRIMARY KEY,
+     user_id        text NOT NULL,
+     label          text NOT NULL DEFAULT 'Other',
+     is_resume      integer NOT NULL DEFAULT 0,
+     filename       text NOT NULL,
+     mime_type      text NOT NULL,
+     size_bytes     integer NOT NULL,
+     stored_path    text NOT NULL,
+     extract_status text NOT NULL DEFAULT 'ok',
+     extract_note   text NOT NULL DEFAULT '',
+     extracted_text text NOT NULL DEFAULT '',
+     created_at     text NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS materials_user_idx ON materials(user_id, created_at)`,
+  `CREATE TABLE IF NOT EXISTS password_resets (
+     token_hash text PRIMARY KEY,
+     user_id    text NOT NULL,
+     created_at text NOT NULL,
+     expires_at text NOT NULL,
+     used_at    text
+   )`,
+  `CREATE INDEX IF NOT EXISTS password_resets_user_idx ON password_resets(user_id)`,
+  `CREATE TABLE IF NOT EXISTS rate_events (
+     id         integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+     scope      text NOT NULL,
+     bucket     text NOT NULL,
+     created_at text NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS rate_events_idx ON rate_events(scope, bucket, created_at)`,
+  `CREATE TABLE IF NOT EXISTS qualifications (
+     user_id      text PRIMARY KEY,
+     facts_json   text NOT NULL DEFAULT '[]',
+     report_json  text NOT NULL DEFAULT '{}',
+     input_hash   text NOT NULL DEFAULT '',
+     computed_at  text NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS qualification_decisions (
+     user_id            text PRIMARY KEY,
+     decisions_json     text NOT NULL DEFAULT '[]',
+     confirmations_json text NOT NULL DEFAULT '{}',
+     updated_at         text NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS funnel_events (
+     id         text PRIMARY KEY,
+     user_id    text NOT NULL,
+     name       text NOT NULL,
+     created_at text NOT NULL,
+     UNIQUE (user_id, name)
+   )`,
+  `CREATE INDEX IF NOT EXISTS funnel_events_name_idx ON funnel_events(name, created_at)`,
+  `CREATE TABLE IF NOT EXISTS application_choices (
+     user_id        text NOT NULL,
+     application_id text NOT NULL,
+     chosen_at      text NOT NULL,
+     PRIMARY KEY (user_id, application_id)
+   )`,
+];
+
+// ----------------------------------------------------- postgres worker shim ---
+//
+// `Bun.sql` is asynchronous and every caller of this module is not: the exported
+// functions are used synchronously all over the app (server functions, the check
+// scripts, the backup scheduler) and their signatures are part of the contract.
+// So Postgres is reached through one dedicated worker thread that owns the
+// connection, and each statement is a blocking round trip over a
+// `SharedArrayBuffer`: post the statement, `Atomics.wait` for the worker to
+// signal it is done, then read the reply off the message port with
+// `receiveMessageOnPort`. The main thread never runs the event loop while a
+// statement is in flight, which is also why a transaction here is safe: nothing
+// else in this process can interleave between BEGIN and COMMIT.
+//
+// The worker is part of this file as source text, so it survives bundling: there
+// is no extra file to ship and no path to get wrong in the built server.
+const PG_WORKER_SOURCE = `
+const { parentPort } = require("node:worker_threads");
+let channel = null;
+let signal = null;
+let db = null;
+let tx = null;
+let url = null;
+let inTransaction = false;
+function reply(message) {
+  channel.postMessage(message);
+  Atomics.store(signal, 0, 1);
+  Atomics.notify(signal, 0);
+}
+// bigint columns (a bare COUNT(*)) come back as BigInt; the app counts with
+// numbers, so they are converted here rather than in 62 call sites.
+function norm(value) {
+  if (typeof value === "bigint") return Number(value);
+  if (Array.isArray(value)) return value.map(norm);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const key of Object.keys(value)) out[key] = norm(value[key]);
+    return out;
+  }
+  return value;
+}
+async function exec(conn, text, params) {
+  const result = params && params.length ? await conn.unsafe(text, params) : await conn.unsafe(text);
+  const rows = Array.isArray(result) ? norm(result) : [];
+  const count = result && typeof result.count === "number" ? result.count : rows.length;
+  return { rows: rows, count: count };
+}
+function message(source) {
+  return String(source && source.message ? source.message : source);
+}
+function newTx() {
+  tx = new Bun.sql({ url: url, max: 1 });
+}
+parentPort.on("message", async (request) => {
+  try {
+    switch (request.op) {
+      case "init": {
+        channel = request.channel;
+        signal = new Int32Array(request.signal);
+        url = request.url;
+        db = new Bun.sql(url);
+        newTx();
+        for (const statement of request.schema) await db.unsafe(statement);
+        await db.unsafe("SELECT 1");
+        reply({ id: request.id, ok: true });
+        return;
+      }
+      case "query": {
+        const result = await exec(inTransaction ? tx : db, request.text, request.params);
+        reply({ id: request.id, ok: true, rows: result.rows, count: result.count });
+        return;
+      }
+      case "begin": {
+        await tx.unsafe("BEGIN");
+        inTransaction = true;
+        reply({ id: request.id, ok: true });
+        return;
+      }
+      case "commit": {
+        await tx.unsafe("COMMIT");
+        inTransaction = false;
+        reply({ id: request.id, ok: true });
+        return;
+      }
+      case "rollback": {
+        try { await tx.unsafe("ROLLBACK"); } catch (rolledBackEarly) { /* connection already gone */ }
+        inTransaction = false;
+        reply({ id: request.id, ok: true });
+        return;
+      }
+      case "reset": {
+        // A transaction connection that failed is discarded: the next BEGIN
+        // opens a fresh one rather than reusing a poisoned session.
+        try { await tx.unsafe("ROLLBACK"); } catch (nothingToRollBack) { /* not in a transaction */ }
+        try { await tx.end(); } catch (alreadyClosed) { /* nothing to close */ }
+        inTransaction = false;
+        newTx();
+        reply({ id: request.id, ok: true });
+        return;
+      }
+      case "close": {
+        try { await tx.end(); } catch (alreadyClosed) { /* nothing to close */ }
+        try { await db.end(); } catch (alreadyClosed) { /* nothing to close */ }
+        reply({ id: request.id, ok: true });
+        return;
+      }
+      default:
+        reply({ id: request.id, ok: false, error: "unknown worker op " + String(request.op) });
+    }
+  } catch (error) {
+    // Reported, never thrown: an unhandled rejection here would kill the worker
+    // and leave the main thread waiting on a signal that never comes.
+    reply({ id: request.id, ok: false, error: message(error) });
+  }
+});
+`;
+
+/** How long the first connection (schema creation included) may take. */
+const PG_CONNECT_TIMEOUT_MS = 30_000;
+/** How long any single statement may take before the store is treated as lost. */
+const PG_QUERY_TIMEOUT_MS = 60_000;
+
+type WorkerReply = { id: number; ok: boolean; rows?: unknown[]; count?: number; error?: string };
+
+/**
+ * The main-thread half of the shim above: a synchronous `query(sql, params)`
+ * over a worker that owns `Bun.sql`.
+ *
+ * Failure is always loud. If the database cannot be reached, `start()` throws
+ * with what was tried and what came back; it never quietly opens a local file
+ * instead, because a silent fallback would look like it was saving a real
+ * person's data while actually writing to a store the next publish deletes.
+ */
+class PostgresStore {
+  private worker: Worker | null = null;
+  private channel: import("node:worker_threads").MessagePort | null = null;
+  private signal: Int32Array | null = null;
+  private nextId = 1;
+  private txOpen = false;
+
+  /** Opens the connection and applies the schema, once. Throws if it cannot. */
+  open(): void {
+    if (this.worker) return;
+    const url = DATABASE_URL.url;
+    if (!url) {
+      throw new Error(
+        "[applypilot] internal error: the Postgres store was opened without a DATABASE_URL."
+      );
+    }
+    const worker = new Worker(PG_WORKER_SOURCE, { eval: true });
+    // The store must never be the reason a process refuses to exit: a check
+    // script that has finished its work should end, not hang on a live worker.
+    worker.unref();
+    const { port1, port2 } = new MessageChannel();
+    const signal = new Int32Array(new SharedArrayBuffer(4));
+    this.worker = worker;
+    this.channel = port1;
+    this.signal = signal;
+    try {
+      this.call(
+        "init",
+        { channel: port2, signal: signal.buffer, url, schema: POSTGRES_SCHEMA },
+        PG_CONNECT_TIMEOUT_MS,
+        [port2]
+      );
+    } catch (error) {
+      this.abandon();
+      throw new Error(
+        `[applypilot] cannot use the managed database at ${redactDatabaseUrl(url)} — ` +
+          `${errorText(error)}. The app will not fall back to a local file: that file would be ` +
+          "deleted by the next publish while telling the user their data was saved. Check " +
+          "DATABASE_URL (host, port, database, user, password) and that the database is reachable."
+      );
+    }
+  }
+
+  /** One statement, blocking until the worker has the answer. */
+  query(sql: string, params: unknown[] = []): { rows: unknown[]; count: number } {
+    const reply = this.call("query", {
+      text: toPostgresPlaceholders(sql),
+      params: params.length ? params : undefined,
+    });
+    return { rows: reply.rows ?? [], count: reply.count ?? 0 };
+  }
+
+  /**
+   * Runs `fn` inside one database transaction. Commits on return, rolls back on
+   * throw. Nested calls join the outer transaction, so a helper that starts one
+   * cannot deadlock the store.
+   */
+  transaction<T>(fn: () => T): T {
+    if (this.txOpen) return fn();
+    this.call("begin");
+    this.txOpen = true;
+    try {
+      const result = fn();
+      this.call("commit");
+      this.txOpen = false;
+      return result;
+    } catch (error) {
+      try {
+        this.call("rollback");
+      } catch {
+        // The transaction connection is already gone; the reset below makes the
+        // next transaction open a fresh one.
+      }
+      this.txOpen = false;
+      try {
+        this.call("reset");
+      } catch {
+        // Nothing else to do: the original error is the one worth reporting.
+      }
+      throw error;
+    }
+  }
+
+  /** Closes the connection. Used by tests and by a clean shutdown. */
+  close(): void {
+    if (!this.worker) return;
+    try {
+      this.call("close");
+    } catch {
+      // Closing a store that is already unreachable is not an error worth raising.
+    }
+    this.abandon();
+  }
+
+  private call(
+    op: string,
+    extra: Record<string, unknown> = {},
+    timeoutMs = PG_QUERY_TIMEOUT_MS,
+    transfer: readonly unknown[] = []
+  ): WorkerReply {
+    const worker = this.worker;
+    const channel = this.channel;
+    const signal = this.signal;
+    if (!worker || !channel || !signal) {
+      throw new Error("[applypilot] the Postgres store is not open");
+    }
+    const id = this.nextId++;
+    Atomics.store(signal, 0, 0);
+    worker.postMessage({ id, op, ...extra }, transfer as never[]);
+    const wait = Atomics.wait(signal, 0, 0, timeoutMs);
+    if (wait === "timed-out") {
+      // A statement that never came back cannot be cancelled safely, and the
+      // worker may still be holding a connection: drop the whole thing, so the
+      // next caller opens a fresh one instead of reading someone else's reply.
+      this.abandon();
+      throw new Error(
+        `[applypilot] the database did not answer within ${String(timeoutMs)}ms ` +
+          `(statement type: ${op}). The store has been taken down; a later request will ` +
+          "reconnect rather than reuse a connection that may still be busy."
+      );
+    }
+    let reply: WorkerReply | undefined;
+    let seen = receiveMessageOnPort(channel);
+    while (seen && (seen.message as WorkerReply).id !== id) {
+      // A late reply to an earlier, abandoned statement — skip it.
+      seen = receiveMessageOnPort(channel);
+    }
+    reply = seen?.message as WorkerReply | undefined;
+    if (!reply) throw new Error(`[applypilot] the database gave no answer to ${op}`);
+    if (!reply.ok) throw new Error(reply.error ?? "the database rejected the statement");
+    return reply;
+  }
+
+  private abandon(): void {
+    const worker = this.worker;
+    this.worker = null;
+    this.channel = null;
+    this.signal = null;
+    this.txOpen = false;
+    if (worker) {
+      // terminate() rather than a polite close: whatever wedged the statement is
+      // still running, and the next use starts from a clean worker.
+      void worker.terminate().catch(() => undefined);
+    }
+  }
+}
+
+/**
+ * `?` is how every statement in this file is written; Postgres wants `$1, $2…`.
+ * Only bare `?` outside string literals are placeholders — the schema's
+ * `DEFAULT '[]'` and any quoted text are left exactly as they are.
+ */
+function toPostgresPlaceholders(sql: string): string {
+  let out = "";
+  let index = 0;
+  let inString = false;
+  for (const character of sql) {
+    if (character === "'") {
+      inString = !inString;
+      out += character;
+      continue;
+    }
+    if (character === "?" && !inString) {
+      index += 1;
+      out += "$" + String(index);
+      continue;
+    }
+    out += character;
+  }
+  return out;
+}
+
+let store: PostgresStore | null = null;
+
+/** The Postgres connection, opened on first use. Loud when it cannot be opened. */
+function postgres(): PostgresStore {
+  if (!store) {
+    const next = new PostgresStore();
+    next.open();
+    store = next;
+  }
+  return store;
+}
 
 let handle: Database | null = null;
 
-function db(): Database {
+function sqliteDb(): Database {
   if (handle) return handle;
   // Create (and prove writable) the directories this store needs before opening
   // the file, so a bad location throws a message that says what to fix instead
@@ -374,27 +911,67 @@ export function storageReport(): {
   users: number;
   tables: Record<string, number>;
 } {
-  assertDataDirUsable(LOCATION.dir);
+  // The file backend needs its directory to exist and be writable — that is
+  // where the database goes. The managed backend keeps only uploads there, so a
+  // directory that cannot be made is a warning about uploads, not a reason to
+  // refuse to start against a database that is perfectly reachable.
+  if (LOCATION.backend === "sqlite") {
+    assertDataDirUsable(LOCATION.dir);
+  } else {
+    try {
+      ensureDataDir(LOCATION.uploads);
+    } catch (error) {
+      console.warn(`[applypilot] uploads unavailable: ${errorText(error)}`);
+    }
+  }
   const users = databaseInfo().users;
   return { location: LOCATION, users, tables: tableCounts() };
 }
 
-/** Small helper so callers never hold a raw statement. */
+/**
+ * One statement, on whichever store is in use. Every function below is written
+ * once, in a dialect both engines accept: `?` placeholders (translated to `$1…`
+ * for Postgres), `CAST(COUNT(*) AS integer)` rather than a bare count (Postgres
+ * returns that as a bigint string otherwise), and `ON CONFLICT … DO NOTHING`,
+ * which is the same syntax on both. Anything an engine cannot do at all lives
+ * behind one of the helpers here, never in a caller.
+ */
 function all<T>(sql: string, params: unknown[] = []): T[] {
-  return db()
+  if (isPostgres()) return postgres().query(sql, params).rows as T[];
+  return sqliteDb()
     .query(sql)
     .all(...(params as never[])) as T[];
 }
 function one<T>(sql: string, params: unknown[] = []): T | null {
-  const row = db()
+  if (isPostgres()) {
+    const rows = postgres().query(sql, params).rows as T[];
+    return rows[0] ?? null;
+  }
+  const row = sqliteDb()
     .query(sql)
     .get(...(params as never[]));
   return (row as T | undefined) ?? null;
 }
-function run(sql: string, params: unknown[] = []): void {
-  db()
+/** Runs a write and reports how many rows it touched (Postgres `count`, SQLite `changes`). */
+function run(sql: string, params: unknown[] = []): number {
+  if (isPostgres()) return postgres().query(sql, params).count;
+  return sqliteDb()
     .query(sql)
-    .run(...(params as never[]));
+    .run(...(params as never[])).changes;
+}
+
+/**
+ * One transaction, on either engine. Commits when `fn` returns, rolls back when
+ * it throws. Nested calls join the outer transaction on both backends.
+ */
+function transaction<T>(fn: () => T): T {
+  if (isPostgres()) return postgres().transaction(fn);
+  return sqliteDb().transaction(fn)();
+}
+
+/** True when the managed backend was selected by `DATABASE_URL`. */
+function isPostgres(): boolean {
+  return LOCATION.backend === "postgres";
 }
 
 export function nowIso(): string {
@@ -665,7 +1242,7 @@ export function deleteApplication(userId: string, id: string): void {
 
 /** Test/diagnostic only: proves the file-backed database is reachable. */
 export function databaseInfo(): { path: string; users: number } {
-  const row = one<{ n: number }>("SELECT COUNT(*) AS n FROM users");
+  const row = one<{ n: number }>("SELECT CAST(COUNT(*) AS integer) AS n FROM users");
   return { path: DB_PATH, users: row?.n ?? 0 };
 }
 
@@ -689,7 +1266,7 @@ export type Material = {
 };
 
 export function countMaterials(userId: string): number {
-  const row = one<{ n: number }>("SELECT COUNT(*) AS n FROM materials WHERE user_id = ?", [userId]);
+  const row = one<{ n: number }>("SELECT CAST(COUNT(*) AS integer) AS n FROM materials WHERE user_id = ?", [userId]);
   return row?.n ?? 0;
 }
 
@@ -774,23 +1351,24 @@ export function findResetUser(tokenHash: string): { user_id: string; expires_at:
 /**
  * Spends a reset token, atomically, and hands back whose it was. The UPDATE is
  * guarded on `used_at IS NULL`, so two requests arriving with the same link at
- * the same moment cannot both win: exactly one sees `changes === 1`. Null means
+ * the same moment cannot both win: exactly one sees a row count of 1. Null means
  * the link is unknown, expired, or already used — the caller must not say which.
  */
 export function claimReset(tokenHash: string): { user_id: string } | null {
   const row = findResetUser(tokenHash);
   if (!row) return null;
-  const result = db()
-    .query("UPDATE password_resets SET used_at = ? WHERE token_hash = ? AND used_at IS NULL")
-    .run(nowIso(), tokenHash);
-  if (result.changes !== 1) return null;
+  const spent = run(
+    "UPDATE password_resets SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
+    [nowIso(), tokenHash]
+  );
+  if (spent !== 1) return null;
   return { user_id: row.user_id };
 }
 
 /** Called after a successful reset and before reissuing a token (one live link at a time). */
 export function deleteResetsForUser(userId: string): number {
   const before = one<{ n: number }>(
-    "SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?",
+    "SELECT CAST(COUNT(*) AS integer) AS n FROM password_resets WHERE user_id = ?",
     [userId]
   );
   run("DELETE FROM password_resets WHERE user_id = ?", [userId]);
@@ -803,7 +1381,7 @@ export function deleteExpiredResets(): void {
 
 /** Signs the account out everywhere — used after a password reset. */
 export function deleteSessionsForUser(userId: string): number {
-  const before = one<{ n: number }>("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?", [userId]);
+  const before = one<{ n: number }>("SELECT CAST(COUNT(*) AS integer) AS n FROM sessions WHERE user_id = ?", [userId]);
   run("DELETE FROM sessions WHERE user_id = ?", [userId]);
   return before?.n ?? 0;
 }
@@ -820,7 +1398,7 @@ export function recordRateEvent(scope: string, bucket: string): void {
 
 export function countRateEvents(scope: string, bucket: string, sinceIso: string): number {
   const row = one<{ n: number }>(
-    "SELECT COUNT(*) AS n FROM rate_events WHERE scope = ? AND bucket = ? AND created_at >= ?",
+    "SELECT CAST(COUNT(*) AS integer) AS n FROM rate_events WHERE scope = ? AND bucket = ? AND created_at >= ?",
     [scope, bucket, sinceIso]
   );
   return row?.n ?? 0;
@@ -959,28 +1537,22 @@ function inWalkOrder(rows: FunnelEvent[]): FunnelEvent[] {
 /**
  * Records that this account has reached this step, and reports whether it was
  * new. Written once per account and step: the UNIQUE(user_id, name) index is the
- * real guard, and this read-then-insert inside one transaction is what turns a
- * repeated action (saving the vault a second time, adding a second posting)
- * into no second row.
+ * real guard, and one `INSERT … ON CONFLICT (user_id, name) DO NOTHING` is what
+ * turns a repeated action (saving the vault a second time, adding a second
+ * posting) into no second row — in a single statement, so two requests racing
+ * cannot both be told they were the first. The row count says which happened:
+ * 1 = this call recorded the step, 0 = it was already recorded.
  *
  * The caller must be the real action, never a page render — see the check script,
  * which proves reading a page writes nothing.
  */
 export function recordFunnelEvent(userId: string, name: FunnelEventName): boolean {
-  return db().transaction(() => {
-    const existing = one<{ id: string }>(
-      "SELECT id FROM funnel_events WHERE user_id = ? AND name = ?",
-      [userId, name]
-    );
-    if (existing) return false;
-    run("INSERT INTO funnel_events (id, user_id, name, created_at) VALUES (?, ?, ?, ?)", [
-      newId(),
-      userId,
-      name,
-      nowIso(),
-    ]);
-    return true;
-  })();
+  const inserted = run(
+    "INSERT INTO funnel_events (id, user_id, name, created_at) VALUES (?, ?, ?, ?) " +
+      "ON CONFLICT (user_id, name) DO NOTHING",
+    [newId(), userId, name, nowIso()]
+  );
+  return inserted === 1;
 }
 
 /** This account's own steps, oldest first — what the account holder did, no more. */
@@ -1019,7 +1591,7 @@ export function listAllFunnelEvents(limit = 1000): FunnelEvent[] {
 export function funnelSummary(): Array<{ name: FunnelEventName; accounts: number }> {
   const counts = new Map<string, number>();
   for (const row of all<{ name: string; n: number }>(
-    "SELECT name, COUNT(DISTINCT user_id) AS n FROM funnel_events GROUP BY name"
+    "SELECT name, CAST(COUNT(DISTINCT user_id) AS integer) AS n FROM funnel_events GROUP BY name"
   )) {
     counts.set(row.name, row.n);
   }
@@ -1032,13 +1604,19 @@ export function funnelSummary(): Array<{ name: FunnelEventName; accounts: number
  * in: `(id, user_id, name, created_at)` is the entire list.
  */
 export function funnelEventColumns(): string[] {
-  const rows = db().query("PRAGMA table_info(funnel_events)").all() as Array<{ name: unknown }>;
+  if (isPostgres()) {
+    return all<{ name: string }>(
+      "SELECT column_name AS name FROM information_schema.columns " +
+        "WHERE table_schema = 'public' AND table_name = 'funnel_events' ORDER BY ordinal_position"
+    ).map((row) => String(row.name));
+  }
+  const rows = sqliteDb().query("PRAGMA table_info(funnel_events)").all() as Array<{ name: unknown }>;
   return rows.map((row) => String(row.name));
 }
 
 /** Total rows in the funnel table — tooling only. */
 export function funnelEventCount(): number {
-  return one<{ n: number }>("SELECT COUNT(*) AS n FROM funnel_events")?.n ?? 0;
+  return one<{ n: number }>("SELECT CAST(COUNT(*) AS integer) AS n FROM funnel_events")?.n ?? 0;
 }
 
 // ------------------------------------------- the application taken forward ---
@@ -1055,19 +1633,14 @@ export type ApplicationChoice = {
  * forward twice changes nothing and records nothing new.
  */
 export function saveApplicationChoice(userId: string, applicationId: string): boolean {
-  return db().transaction(() => {
-    const existing = one<{ chosen_at: string }>(
-      "SELECT chosen_at FROM application_choices WHERE user_id = ? AND application_id = ?",
-      [userId, applicationId]
-    );
-    if (existing) return false;
-    run("INSERT INTO application_choices (user_id, application_id, chosen_at) VALUES (?, ?, ?)", [
-      userId,
-      applicationId,
-      nowIso(),
-    ]);
-    return true;
-  })();
+  // One statement, guarded by the primary key on (user_id, application_id): the
+  // row count is 1 only when this call is the one that created the mark.
+  const inserted = run(
+    "INSERT INTO application_choices (user_id, application_id, chosen_at) VALUES (?, ?, ?) " +
+      "ON CONFLICT (user_id, application_id) DO NOTHING",
+    [userId, applicationId, nowIso()]
+  );
+  return inserted === 1;
 }
 
 export function getApplicationChoice(userId: string, applicationId: string): ApplicationChoice | null {
@@ -1122,21 +1695,21 @@ export function deleteAccount(userId: string): DeletedAccount | null {
   const counts = (sql: string): number => one<{ n: number }>(sql, [userId])?.n ?? 0;
   const deleted: DeletedAccount = {
     email: user.email,
-    users: counts("SELECT COUNT(*) AS n FROM users WHERE id = ?"),
-    profiles: counts("SELECT COUNT(*) AS n FROM profiles WHERE user_id = ?"),
-    applications: counts("SELECT COUNT(*) AS n FROM applications WHERE user_id = ?"),
-    materials: counts("SELECT COUNT(*) AS n FROM materials WHERE user_id = ?"),
-    sessions: counts("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?"),
-    resets: counts("SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?"),
-    qualifications: counts("SELECT COUNT(*) AS n FROM qualifications WHERE user_id = ?"),
-    qualificationDecisions: counts("SELECT COUNT(*) AS n FROM qualification_decisions WHERE user_id = ?"),
-    funnelEvents: counts("SELECT COUNT(*) AS n FROM funnel_events WHERE user_id = ?"),
-    applicationChoices: counts("SELECT COUNT(*) AS n FROM application_choices WHERE user_id = ?"),
+    users: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM users WHERE id = ?"),
+    profiles: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM profiles WHERE user_id = ?"),
+    applications: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM applications WHERE user_id = ?"),
+    materials: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM materials WHERE user_id = ?"),
+    sessions: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM sessions WHERE user_id = ?"),
+    resets: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM password_resets WHERE user_id = ?"),
+    qualifications: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM qualifications WHERE user_id = ?"),
+    qualificationDecisions: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM qualification_decisions WHERE user_id = ?"),
+    funnelEvents: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM funnel_events WHERE user_id = ?"),
+    applicationChoices: counts("SELECT CAST(COUNT(*) AS integer) AS n FROM application_choices WHERE user_id = ?"),
     rateEvents: 0,
     materialPaths: materials.map((m) => m.stored_path),
   };
 
-  db().transaction(() => {
+  transaction(() => {
     run("DELETE FROM materials WHERE user_id = ?", [userId]);
     run("DELETE FROM applications WHERE user_id = ?", [userId]);
     run("DELETE FROM profiles WHERE user_id = ?", [userId]);
@@ -1150,7 +1723,7 @@ export function deleteAccount(userId: string): DeletedAccount | null {
     run("DELETE FROM funnel_events WHERE user_id = ?", [userId]);
     run("DELETE FROM application_choices WHERE user_id = ?", [userId]);
     run("DELETE FROM users WHERE id = ?", [userId]);
-  })();
+  });
 
   return deleted;
 }
@@ -1160,20 +1733,20 @@ export function countRowsForUser(userId: string): Record<string, number> {
   const count = (sql: string, params: unknown[]): number =>
     one<{ n: number }>(sql, params)?.n ?? 0;
   return {
-    users: count("SELECT COUNT(*) AS n FROM users WHERE id = ?", [userId]),
-    profiles: count("SELECT COUNT(*) AS n FROM profiles WHERE user_id = ?", [userId]),
-    applications: count("SELECT COUNT(*) AS n FROM applications WHERE user_id = ?", [userId]),
-    materials: count("SELECT COUNT(*) AS n FROM materials WHERE user_id = ?", [userId]),
-    sessions: count("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?", [userId]),
-    password_resets: count("SELECT COUNT(*) AS n FROM password_resets WHERE user_id = ?", [userId]),
-    qualifications: count("SELECT COUNT(*) AS n FROM qualifications WHERE user_id = ?", [userId]),
+    users: count("SELECT CAST(COUNT(*) AS integer) AS n FROM users WHERE id = ?", [userId]),
+    profiles: count("SELECT CAST(COUNT(*) AS integer) AS n FROM profiles WHERE user_id = ?", [userId]),
+    applications: count("SELECT CAST(COUNT(*) AS integer) AS n FROM applications WHERE user_id = ?", [userId]),
+    materials: count("SELECT CAST(COUNT(*) AS integer) AS n FROM materials WHERE user_id = ?", [userId]),
+    sessions: count("SELECT CAST(COUNT(*) AS integer) AS n FROM sessions WHERE user_id = ?", [userId]),
+    password_resets: count("SELECT CAST(COUNT(*) AS integer) AS n FROM password_resets WHERE user_id = ?", [userId]),
+    qualifications: count("SELECT CAST(COUNT(*) AS integer) AS n FROM qualifications WHERE user_id = ?", [userId]),
     qualification_decisions: count(
-      "SELECT COUNT(*) AS n FROM qualification_decisions WHERE user_id = ?",
+      "SELECT CAST(COUNT(*) AS integer) AS n FROM qualification_decisions WHERE user_id = ?",
       [userId]
     ),
-    funnel_events: count("SELECT COUNT(*) AS n FROM funnel_events WHERE user_id = ?", [userId]),
+    funnel_events: count("SELECT CAST(COUNT(*) AS integer) AS n FROM funnel_events WHERE user_id = ?", [userId]),
     application_choices: count(
-      "SELECT COUNT(*) AS n FROM application_choices WHERE user_id = ?",
+      "SELECT CAST(COUNT(*) AS integer) AS n FROM application_choices WHERE user_id = ?",
       [userId]
     ),
   };
@@ -1314,14 +1887,19 @@ export function tableCounts(): Record<string, number> {
   const out: Record<string, number> = {};
   for (const name of names) {
     // `name` comes from this fixed list, never from input.
-    out[name] = one<{ n: number }>(`SELECT COUNT(*) AS n FROM ${name}`)?.n ?? 0;
+    out[name] = one<{ n: number }>(`SELECT CAST(COUNT(*) AS integer) AS n FROM ${name}`)?.n ?? 0;
   }
   return out;
 }
 
-/** Flushes WAL pages into the main database file before it is copied. */
+/**
+ * Flushes WAL pages into the main database file before it is copied. That is a
+ * SQLite idea; there is no WAL file to flush on the managed backend, so this is
+ * deliberately nothing there rather than an error.
+ */
 export function checkpoint(): void {
-  db().exec("PRAGMA wal_checkpoint(TRUNCATE);");
+  if (isPostgres()) return;
+  sqliteDb().exec("PRAGMA wal_checkpoint(TRUNCATE);");
 }
 
 /**
@@ -1329,12 +1907,28 @@ export function checkpoint(): void {
  * (SQLite's own VACUUM INTO — the destination must not already exist). Safer
  * than copying the file while the app is running: the snapshot is taken inside
  * a transaction, so a concurrent write cannot leave a torn backup.
+ *
+ * This is the file backend's backup. The managed backend has no single file to
+ * snapshot: backing it up means pg_dump (or the provider's own snapshots), which
+ * is a different artefact and is not built yet — so this refuses loudly instead
+ * of writing an empty or partial file that a restore would later trust.
  */
 export function vacuumInto(path: string): void {
-  db().exec(`VACUUM INTO '${path.replace(/'/g, "''")}'`);
+  if (isPostgres()) {
+    throw new Error(
+      `[applypilot] backup to ${path} is not available on the managed database backend: ` +
+        "there is no SQLite file to snapshot. Use the provider's backups or pg_dump. " +
+        "(The daily file backup runs only when DATABASE_URL is unset.)"
+    );
+  }
+  sqliteDb().exec(`VACUUM INTO '${path.replace(/'/g, "''")}'`);
 }
 
-/** Where the database file itself lives (used by the backup/verify tooling). */
+/**
+ * Where the database itself lives (used by the backup/verify tooling): the
+ * absolute path of the SQLite file, or — on the managed backend — the connection
+ * target with every credential removed, because there is no file to name.
+ */
 export function databasePath(): string {
   return DB_PATH;
 }

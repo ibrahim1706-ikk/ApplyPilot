@@ -37,7 +37,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { tableCounts, uploadsRoot, vacuumInto, nowIso, dataDir } from "../db";
+import { tableCounts, uploadsRoot, vacuumInto, nowIso, dataDir, dataLocation } from "../db";
 
 /** How many dated backups to keep. Two weeks of history. */
 export const KEEP_BACKUPS = 14;
@@ -223,6 +223,14 @@ export type ScheduleOutcome =
 
 /** Runs the day's backup if it is due (after BACKUP_HOUR and not already done). */
 export function runScheduledBackupIfDue(now: Date = new Date()): ScheduleOutcome {
+  // The daily artefact is a snapshot of the SQLite file. On the managed backend
+  // there is no such file: the data is not on this machine to copy, and backing
+  // it up is the provider's job (or a pg_dump, which is not built yet). Skipping
+  // with a reason is the honest outcome — a failure logged every 20 minutes
+  // would read as a broken backup rather than one that does not apply here.
+  if (dataLocation().managed) {
+    return { ran: false, reason: "not applicable: the store is a managed database, not a file" };
+  }
   if (now.getHours() < BACKUP_HOUR) {
     return { ran: false, reason: `before ${String(BACKUP_HOUR)}:00 local` };
   }
