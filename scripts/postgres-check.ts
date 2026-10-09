@@ -53,6 +53,13 @@
  * publish. Every assertion about the boot log is therefore made against the same
  * strings, read out of serve.ts by assertion in case 5.
  *
+ * WHAT IT WRITES. Cases 6 and 7 create test accounts and applications in whatever
+ * DATABASE_URL names, and case 5 creates and drops a scratch role and database
+ * through `sudo -u postgres psql`. Case 7 deletes the eighty accounts it made
+ * once they have been read back (7h); case 6 leaves two behind. Nothing of the
+ * sort is written to the SQLite side: the without-DATABASE_URL runs use a
+ * temporary directory each.
+ *
  * Exit codes: 0 every case passed; 1 at least one failed (named); 2 nothing failed
  * but something could not be proved here.
  */
@@ -68,13 +75,6 @@ const BASE_URL =
   (process.env.DATABASE_URL ?? "").trim() ||
   DEFAULT_URL;
 
-const childArg = process.argv.find((argument) => argument.startsWith("--child="));
-if (childArg) {
-  await runChild(childArg.slice("--child=".length));
-} else {
-  await runSuite();
-}
-
 // ---------------------------------------------------------------- child modes ---
 /**
  * Runs one child role. `serve` is a real HTTP server over the app's storage
@@ -86,6 +86,7 @@ async function runChild(mode: string): Promise<void> {
   if (mode === "write") return writeChild();
   if (mode === "verify") return verifyChild();
   if (mode === "count") return countChild();
+  if (mode === "purge") return purgeChild();
   console.error(`postgres-check: unknown child mode "${mode}"`);
   process.exit(64);
 }
@@ -181,16 +182,17 @@ async function serveChild(): Promise<void> {
 
 /** One writer process: CHECK_TAG + CHECK_COUNT distinct accounts and applications. */
 async function writeChild(): Promise<void> {
+  const run = process.env.CHECK_RUN ?? "r";
   const tag = process.env.CHECK_TAG ?? "w";
   const count = Number(process.env.CHECK_COUNT ?? "10");
   const db: Store = await import("../src/db");
   const ids: string[] = [];
   const started = Date.now();
   for (let index = 0; index < count; index += 1) {
-    const user = db.createUser(`pgcheck-${tag}-${String(index)}@example.com`, "hash");
+    const user = db.createUser(`pgcheck-${run}-${tag}-${String(index)}@example.com`, "hash");
     const application = db.createApplication({
       userId: user.id,
-      title: `concurrent ${tag} ${String(index)}`,
+      title: `concurrent ${run} ${tag} ${String(index)}`,
       company: `check-${tag}`,
       url: "http://127.0.0.1/check",
       postingText: "check",
@@ -204,6 +206,7 @@ async function writeChild(): Promise<void> {
 /** Reads the rows back through the storage layer, for the concurrency case. */
 async function verifyChild(): Promise<void> {
   const db: Store = await import("../src/db");
+  const run = process.env.CHECK_RUN ?? "r";
   const tags = (process.env.CHECK_TAGS ?? "w").split(",");
   const count = Number(process.env.CHECK_COUNT ?? "10");
   const missing: string[] = [];
@@ -211,7 +214,7 @@ async function verifyChild(): Promise<void> {
   const titlesWrong: string[] = [];
   for (const tag of tags) {
     for (let index = 0; index < count; index += 1) {
-      const email = `pgcheck-${tag}-${String(index)}@example.com`;
+      const email = `pgcheck-${run}-${tag}-${String(index)}@example.com`;
       const user = db.findUserByEmail(email);
       if (!user) {
         missing.push(email);
@@ -224,7 +227,7 @@ async function verifyChild(): Promise<void> {
       }
       const application = applications[0] as { id: string; title: string };
       appIds.push(application.id);
-      if (application.title !== `concurrent ${tag} ${String(index)}`) {
+      if (application.title !== `concurrent ${run} ${tag} ${String(index)}`) {
         titlesWrong.push(`${email}: ${application.title}`);
       }
     }
@@ -239,6 +242,31 @@ async function verifyChild(): Promise<void> {
       users: db.databaseInfo().users,
     })
   );
+}
+
+/**
+ * Removes the accounts a concurrency run created. Deliberately part of the
+ * suite: it is meant to be pointed at whatever database the app is about to use,
+ * and leaving eighty test accounts behind in that one would be a poor trade.
+ */
+async function purgeChild(): Promise<void> {
+  const db: Store = await import("../src/db");
+  const run = process.env.CHECK_RUN ?? "r";
+  const tags = (process.env.CHECK_TAGS ?? "w").split(",");
+  const count = Number(process.env.CHECK_COUNT ?? "10");
+  let deleted = 0;
+  let remaining = 0;
+  for (const tag of tags) {
+    for (let index = 0; index < count; index += 1) {
+      const email = `pgcheck-${run}-${tag}-${String(index)}@example.com`;
+      const user = db.findUserByEmail(email);
+      if (!user) continue;
+      db.deleteAccount(user.id);
+      deleted += 1;
+      if (db.findUserByEmail(email)) remaining += 1;
+    }
+  }
+  console.log(JSON.stringify({ deleted, remaining }));
 }
 
 async function countChild(): Promise<void> {
@@ -830,6 +858,9 @@ async function caseConcurrency(reachable: boolean): Promise<void> {
     return;
   }
   const count = 20;
+  // Unique per run: re-running the suite must not collide with the accounts the
+  // previous run left in the database.
+  const run = Math.random().toString(36).slice(2, 8);
   const tags = ["c1", "c2", "c3", "c4"];
   const before = startChild("count", { DATABASE_URL: BASE_URL, APPLYPILOT_DATA_DIR: tempDir("conc-before") });
   const beforeCode = await exitWithin(before, 30_000);
@@ -846,6 +877,7 @@ async function caseConcurrency(reachable: boolean): Promise<void> {
       DATABASE_URL: BASE_URL,
       APPLYPILOT_DATA_DIR: tempDir(`conc-${tag}`),
       CHECK_TAG: tag,
+      CHECK_RUN: run,
       CHECK_COUNT: String(count),
     })
   );
@@ -870,6 +902,7 @@ async function caseConcurrency(reachable: boolean): Promise<void> {
     DATABASE_URL: BASE_URL,
     APPLYPILOT_DATA_DIR: tempDir("conc-verify"),
     CHECK_TAGS: tags.join(","),
+    CHECK_RUN: run,
     CHECK_COUNT: String(count),
   });
   const verifyCode = await exitWithin(verify, 60_000);
@@ -900,6 +933,28 @@ async function caseConcurrency(reachable: boolean): Promise<void> {
     typeof verified?.users === "number" && verified.users >= usersBefore + tags.length * count,
     `before=${String(usersBefore)} after=${String(verified?.users)}`
   );
+
+  // Clean up after the evidence is taken: this suite may be pointed at the store
+  // the app is about to use, and eighty leftover test accounts there would be a
+  // side effect nobody asked for.
+  const purge = startChild("purge", {
+    DATABASE_URL: BASE_URL,
+    APPLYPILOT_DATA_DIR: tempDir("conc-purge"),
+    CHECK_TAGS: tags.join(","),
+    CHECK_RUN: run,
+    CHECK_COUNT: String(count),
+  });
+  const purgeCode = await exitWithin(purge, 120_000);
+  const purged = parseJson(purge.stdout()) as { deleted?: number; remaining?: number } | null;
+  const after = startChild("count", { DATABASE_URL: BASE_URL, APPLYPILOT_DATA_DIR: tempDir("conc-after") });
+  await exitWithin(after, 30_000);
+  const afterTables = parseJson(after.stdout()) as { users?: number } | null;
+  console.log(`  purge (exit ${String(purgeCode)}): ${purge.stdout().trim()}`);
+  check(
+    "7h the accounts this case created are deleted again, and the row count returns to where it started",
+    purgeCode === 0 && purged?.deleted === tags.length * count && purged?.remaining === 0 && afterTables?.users === usersBefore,
+    `deleted=${String(purged?.deleted)} remaining=${String(purged?.remaining)} users=${String(afterTables?.users)} (started at ${String(usersBefore)})`
+  );
 }
 
 function parseJson(text: string): unknown {
@@ -927,8 +982,11 @@ function silentFallbackProblems(source: string, serveSource: string): string[] {
   if (!/Refusing to start on the local file backend/.test(source)) {
     problems.push("the refusal text is gone from the storage module");
   }
-  if (!/managed: DATABASE_URL\.url !== null/.test(source)) {
+  if (!/const managed = DATABASE_URL\.url !== null;/.test(source)) {
     problems.push("backend selection no longer follows whether DATABASE_URL was usable");
+  }
+  if (!/backend: managed \? "postgres" : "sqlite",/.test(source)) {
+    problems.push("the reported backend no longer follows the selection");
   }
   if (!/function isPostgres\(\): boolean \{\s*\n\s*return LOCATION\.backend === "postgres";/.test(source)) {
     problems.push("isPostgres() no longer follows the selected backend");
@@ -953,7 +1011,7 @@ function sourceInvariants(dbSource: string, serveSource: string): void {
     ],
     [
       "backend selection is pinned to the file backend",
-      dbSource.replace(/managed: DATABASE_URL\.url !== null/, "managed: false"),
+      dbSource.replace(/const managed = DATABASE_URL\.url !== null;/, "const managed = false;"),
     ],
     [
       "the read path stops branching on the managed backend",
@@ -975,16 +1033,63 @@ const SUITES = [
   "qualifications-check.ts",
 ];
 
+/** A check count from a suite's own summary, or 0 when it printed no count. */
+function suiteCount(out: string): number {
+  const passed = /ALL CHECKS PASSED \((\d+)\)/.exec(out);
+  if (passed) return Number(passed[1]);
+  const failed = /(\d+) CHECK\(S\) FAILED out of (\d+)/.exec(out);
+  if (failed) return Number(failed[2]);
+  // qualifications-check is a report rather than a counter: it prints the facts
+  // it extracted and one labelled verdict. Summing the printed fact totals is the
+  // honest work-done measure for it (and it is non-zero only if it really ran).
+  if (/ALL CHECKS PASSED:/.test(out)) {
+    let facts = 0;
+    for (const match of out.matchAll(/facts: (\d+)/g)) facts += Number(match[1]);
+    return facts;
+  }
+  return 0;
+}
+
+function suiteVerdict(out: string, total: number): string {
+  const passed = /ALL CHECKS PASSED \((\d+)\)/.exec(out);
+  if (passed) return `ALL CHECKS PASSED (${passed[1]})`;
+  const failed = /(\d+) CHECK\(S\) FAILED out of (\d+)/.exec(out);
+  if (failed) return `${failed[1]} of ${failed[2]} failed`;
+  if (/ALL CHECKS PASSED:/.test(out)) return `ALL CHECKS PASSED: (report; ${String(total)} facts extracted)`;
+  return "no summary line";
+}
+
 async function caseSuites(reachable: boolean): Promise<void> {
   section("8b. the four existing suites, with and without DATABASE_URL");
+  // The suites assume they own an empty store: funnel-check asserts an absolute
+  // "the funnel table holds exactly 2 rows". Pointed at a shared database that
+  // already holds anything, it fails for a reason that has nothing to do with the
+  // backend. So the with-Postgres runs get their own throwaway database, reset
+  // before each run — otherwise the run would measure dirt, not the backend.
+  const scratch = reachable ? await suiteDatabase() : null;
+  if (reachable && !scratch) {
+    console.log(
+      "  could not create a clean scratch database (needs sudo psql here); the with-Postgres runs would be reading a store that already holds rows."
+    );
+  }
   for (const suite of SUITES) {
     for (const usePostgres of [false, true]) {
+      const label = usePostgres ? "with DATABASE_URL (Postgres)" : "without DATABASE_URL (SQLite)";
       if (usePostgres && !reachable) {
-        skip(`${suite} with DATABASE_URL`, "base Postgres is not reachable");
+        skip(`${suite} ${label}`, "base Postgres is not reachable");
         continue;
       }
-      const label = usePostgres ? "with DATABASE_URL (Postgres)" : "without DATABASE_URL (SQLite)";
-      const env: Record<string, string | undefined> = usePostgres ? { DATABASE_URL: BASE_URL } : { DATABASE_URL: undefined };
+      if (usePostgres && !scratch) {
+        skip(
+          `${suite} ${label}`,
+          "no clean scratch database could be created; this suite asserts an empty store, so running it against a dirty one would be a false signal"
+        );
+        continue;
+      }
+      if (usePostgres && scratch) await resetSuiteDatabase(scratch);
+      const env: Record<string, string | undefined> = usePostgres && scratch
+        ? { DATABASE_URL: scratch.url }
+        : { DATABASE_URL: undefined };
       const result = Bun.spawnSync({
         cmd: ["bun", "run", join(SITE, "scripts", suite)],
         cwd: SITE,
@@ -993,11 +1098,9 @@ async function caseSuites(reachable: boolean): Promise<void> {
         stderr: "pipe",
       });
       const out = `${result.stdout.toString()}${result.stderr.toString()}`;
-      const passedMatch = /ALL CHECKS PASSED \((\d+)\)/.exec(out);
-      const failedMatch = /(\d+) CHECK\(S\) FAILED out of (\d+)/.exec(out);
-      const total = passedMatch ? Number(passedMatch[1]) : failedMatch ? Number(failedMatch[2]) : 0;
-      console.log(`\n  $ ${usePostgres ? `DATABASE_URL=${redactedBase()} ` : ""}bun run scripts/${suite}`);
-      console.log(`  exit ${String(result.exitCode)} — ${passedMatch ? `ALL CHECKS PASSED (${String(total)})` : failedMatch ? `${failedMatch[1]} of ${failedMatch[2]} failed` : "no summary line"}`);
+      const total = suiteCount(out);
+      console.log(`\n  $ ${usePostgres && scratch ? `DATABASE_URL=postgres at …/${scratch.name} ` : ""}bun run scripts/${suite}`);
+      console.log(`  exit ${String(result.exitCode)} — ${suiteVerdict(out, total)}`);
       check(
         `${suite} ${label}: exit 0 with a non-zero check count (an empty suite cannot pass)`,
         result.exitCode === 0 && total > 0,
@@ -1006,6 +1109,55 @@ async function caseSuites(reachable: boolean): Promise<void> {
       if (result.exitCode !== 0) console.log(out.split("\n").slice(-25).join("\n"));
     }
   }
+  if (scratch) await dropSuiteDatabase(scratch);
+}
+
+type SuiteDatabase = { url: string; name: string; owner: string };
+
+/** A throwaway database for the with-DATABASE_URL suite runs. */
+async function suiteDatabase(): Promise<SuiteDatabase | null> {
+  const parsed = new URL(BASE_URL);
+  const owner = decodeURIComponent(parsed.username) || "postgres";
+  const name = `pgcheck_suites_${Math.random().toString(36).slice(2, 8)}`;
+  if (!adminSql(`CREATE DATABASE ${name} OWNER ${owner}`)) return null;
+  const credentials = parsed.password
+    ? `${parsed.username}:${parsed.password}@`
+    : `${parsed.username}@`;
+  return { url: `postgres://${credentials}${parsed.host}/${name}`, name, owner };
+}
+
+/** Drops and recreates it, so each suite run starts from an empty store. */
+async function resetSuiteDatabase(scratch: SuiteDatabase): Promise<void> {
+  adminSql(`DROP DATABASE IF EXISTS ${scratch.name} WITH (FORCE)`);
+  adminSql(`CREATE DATABASE ${scratch.name} OWNER ${scratch.owner}`);
+}
+
+async function dropSuiteDatabase(scratch: SuiteDatabase): Promise<void> {
+  adminSql(`DROP DATABASE IF EXISTS ${scratch.name} WITH (FORCE)`);
+}
+
+/** One statement as the Postgres superuser, for scratch databases only. */
+function adminSql(sql: string): boolean {
+  const result = Bun.spawnSync({
+    cmd: ["sudo", "-n", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-tAc", sql],
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  if (result.exitCode !== 0) {
+    console.log(`  psql: ${result.stderr.toString().trim() || "(no message)"}`);
+  }
+  return result.exitCode === 0;
+}
+
+// ------------------------------------------------------------------- dispatch ---
+// Last, so every module-level binding above is initialized before either entry
+// point runs: the suite creates state as it goes, and the child modes need the
+// path constants.
+const childArg = process.argv.find((argument) => argument.startsWith("--child="));
+if (childArg) {
+  await runChild(childArg.slice("--child=".length));
+} else {
+  await runSuite();
 }
 
 function childEnv(overrides: Record<string, string | undefined>): Record<string, string> {
