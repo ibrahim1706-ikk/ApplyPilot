@@ -9,7 +9,7 @@
 // with an already-running server. Every sandbox user has passwordless sudo, so
 // the takeover works across user boundaries.
 import handler from "./dist/server/server.js";
-import { storageReport } from "./src/db.ts";
+import { dataLocation, storageReport } from "./src/db.ts";
 import { startBackupScheduler } from "./src/server/backup.ts";
 
 // Pinned, NOT read from the environment. The published preview URL
@@ -71,15 +71,26 @@ for (let attempt = 1; ; attempt++) {
 console.log(`team-site serving on http://${HOST}:${String(PORT)}`);
 
 // Say where durable state lives, at boot, in the log. This is the line to read
-// when asking "did the last publish wipe the accounts?": the data directory must
-// NOT be inside the site folder, because a publish replaces that folder.
+// when asking "did the last publish wipe the accounts?": on the file backend the
+// data directory must NOT be inside the site folder, because a publish replaces
+// that folder — and on the managed backend the accounts are not in that folder
+// at all, which is the whole point of DATABASE_URL.
 try {
   const storage = storageReport();
   const { location } = storage;
   console.log(
+    `[applypilot] store:    ${
+      location.managed
+        ? "postgres (from DATABASE_URL) — accounts survive a publish"
+        : "sqlite file (DATABASE_URL is not set)"
+    }`
+  );
+  console.log(
     `[applypilot] data dir: ${location.dir} (${location.source})` +
       (location.insideSiteRoot ? " — WARNING: inside the published folder!" : "")
   );
+  // Never a credential: on the managed backend this is the host, port and
+  // database with the user name and password stripped off.
   console.log(`[applypilot] database: ${location.database}`);
   console.log(`[applypilot] uploads:  ${location.uploads}`);
   console.log(`[applypilot] rows at boot: ${JSON.stringify(storage.tables)}`);
@@ -88,6 +99,18 @@ try {
     "[applypilot] STORAGE UNAVAILABLE — accounts, uploads and kits cannot be read or saved. " +
       `${error instanceof Error ? error.message : String(error)}`
   );
+  // With DATABASE_URL set, starting anyway would mean serving pages off a local
+  // file that the next publish deletes — the exact failure this store was moved
+  // off the machine to fix, but with the app claiming the user's data is safe.
+  // So a managed store that cannot be reached stops the process instead.
+  if (dataLocation().managed) {
+    console.error(
+      "[applypilot] DATABASE_URL is set and the managed database is unusable, so this process " +
+        "refuses to start on the local file backend. Fix DATABASE_URL (host, port, database, " +
+        "user, password) and start again."
+    );
+    process.exit(1);
+  }
 }
 
 // Nightly backup of the database and the uploads folder. This process is the one
