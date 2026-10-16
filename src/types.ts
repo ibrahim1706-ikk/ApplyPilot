@@ -35,23 +35,56 @@ export type KeywordMatch = {
  * profile field where the real answer belongs.
  */
 export type KitGap = {
-  /** Honest statement of what the posting asks for and what the profile is missing. */
+  /** Honest statement of what the posting asks for and what the kit cannot state. */
   text: string;
-  /** One short instruction naming the field to fill in. */
+  /** One short instruction naming where the detail belongs. */
   action: string;
-  /** Which surface holds that field: the profile vault, or a card on the kit page. */
-  where: "profile" | "kit";
+  /**
+   * Which surface holds that detail: the profile vault, a card on the kit page, or
+   * the review screen. The third one is not decoration — the kit is built only from
+   * facts the user CONFIRMED, so when its material is sitting unconfirmed the gap has
+   * to send them to the one screen where they can confirm it.
+   */
+  where: "profile" | "kit" | "qualifications";
   /** Element id to land on, so the link drops the user at the right field. */
   hash: string;
 };
 
+/**
+ * Where a drafted answer stands, which is what the kit screen's badge says:
+ * `confirmed` it was written from a fact the user confirmed; `pending` the material
+ * covers it but nothing confirmed does, so nothing was written; `excluded` the user
+ * took the fact out on the review screen; `missing` nothing in the material covers
+ * it at all. Optional only so kits stored before this existed still parse — do not
+ * read it without a fallback.
+ */
+export type KitAnswerBasis = "confirmed" | "pending" | "excluded" | "missing";
+
 export type KitAnswer = {
   question: string;
   answer: string;
-  /** Which profile fields this answer was drawn from (shown under the answer). */
+  /** Which confirmed facts this answer was drawn from (shown under the answer). */
   sources: string[];
-  /** True when the profile has nothing to answer this with yet. */
+  /** True when the answer was not written from a fact the user confirmed. */
   missingInput: boolean;
+  /** Why the answer reads the way it does. See `KitAnswerBasis`. */
+  basis?: KitAnswerBasis;
+};
+
+/**
+ * What the kit was allowed to draw on: the facts the user has confirmed, against the
+ * rest of the set. `nothingConfirmed` is the case the kit screen has to say out loud
+ * — with nothing confirmed there is no material in the kit at all, and a kit that
+ * looked complete would be hiding that.
+ *
+ * Optional only so kits stored before this existed still parse.
+ */
+export type KitFactBasis = {
+  confirmed: number;
+  pending: number;
+  excluded: number;
+  factsInSet: number;
+  nothingConfirmed: boolean;
 };
 
 export type Kit = {
@@ -67,10 +100,16 @@ export type Kit = {
   gaps: KitGap[];
   /** Other questions the posting seems to ask, which the kit doesn't draft. */
   postingQuestions: string[];
-  /** Profile fields the kit used, for transparency. */
+  /**
+   * The facts the kit drew on, each named by its own label and restated in its own
+   * words. This list is meant to be EXACTLY that: register-every-use in the engine,
+   * which `scripts/kit-provenance-check.ts` fails if it ever stops holding.
+   */
   profileFactsUsed: string[];
-  /** How much of the profile is filled in (0-100) — drives the "thin kit" warning. */
+  /** Share of the eleven basics a kit needs that the confirmed facts cover (0-100). */
   profileCompleteness: number;
+  /** What the kit was allowed to draw on. See `KitFactBasis`. */
+  factBasis?: KitFactBasis;
 };
 
 export type ApplicationSummary = {

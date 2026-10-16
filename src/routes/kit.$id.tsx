@@ -146,17 +146,42 @@ function KitPage() {
         </Card>
       ) : (
         <div className="mt-6 space-y-5">
+          {kit.factBasis?.nothingConfirmed ? (
+            <Card className="border-amber-400 bg-amber-50">
+              <SectionTitle hint="This is the honest state, not a broken one. Nothing about you has been written here.">
+                Nothing to write from yet — you haven&apos;t confirmed any facts
+              </SectionTitle>
+              <p className="text-sm leading-relaxed text-amber-900">
+                The kit writes only from facts you have confirmed for yourself. Every fact we read from your
+                material is still waiting on the review screen, so there is no cover letter and no drafted
+                answer here that states anything about you. Review and confirm what&apos;s right, then
+                rebuild this kit.
+              </p>
+              <Link
+                to="/qualifications"
+                className={`${buttonStyles.secondary} mt-4`}
+                data-testid="kit-review-facts"
+              >
+                Review and confirm your facts →
+              </Link>
+            </Card>
+          ) : null}
           <Card className="border-slate-300">
             <div className="flex flex-wrap items-center gap-4">
               <div className="mr-auto">
                 <p className="text-sm font-semibold text-slate-900">
                   Keyword match: {kit.keywordMatch.evidenced.length} of{" "}
                   {kit.keywordMatch.evidenced.length + kit.keywordMatch.missing.length} posting keywords are
-                  evidenced by your profile
+                  evidenced by facts you confirmed
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  {kit.profileCompleteness}% of your profile is filled in. More real detail in your profile
-                  means a sharper kit — and gaps are never filled with guesses.
+                  {kit.profileCompleteness}% of the basics a kit needs are confirmed in your facts
+                  {kit.factBasis
+                    ? ` — ${String(kit.factBasis.confirmed)} confirmed, ${String(
+                        kit.factBasis.pending
+                      )} waiting for you, ${String(kit.factBasis.excluded)} you excluded.`
+                    : "."}{" "}
+                  Gaps are never filled with guesses.
                 </p>
               </div>
               <div className="w-40">
@@ -190,6 +215,15 @@ function KitPage() {
                       >
                         {gap.action} →
                       </Link>
+                    ) : gap.where === "qualifications" ? (
+                      <Link
+                        to="/qualifications"
+                        hash={gap.hash}
+                        className="mt-2 inline-flex text-sm font-medium text-indigo-700 underline decoration-indigo-300 hover:text-indigo-600"
+                        data-testid="gap-review-facts"
+                      >
+                        {gap.action} →
+                      </Link>
                     ) : (
                       <a
                         href={`#${gap.hash}`}
@@ -202,28 +236,33 @@ function KitPage() {
                 ))}
               </ul>
               <p className="mt-4 text-xs text-amber-800">
-                Add the missing piece in your profile, save it, then press “Rebuild from my profile” — the kit picks
-                it up. Nothing is filled in for you in the meantime.
+                Add the missing piece where the link points — your profile vault, or the review screen for
+                anything we read that you haven&apos;t confirmed — then press “Rebuild from my profile”. The
+                kit picks it up. Nothing is filled in for you in the meantime.
               </p>
             </Card>
           ) : (
             <Card className="border-emerald-300 bg-emerald-50">
               <p className="text-sm text-emerald-900">
-                Nothing flagged: every requirement this posting mentions is either evidenced by your profile
-                or already answered in it.
+                Nothing flagged in what the kit checked: every requirement it compared your confirmed facts
+                against is either covered by one or already answered in them.
+              </p>
+              <p className="mt-2 text-xs text-emerald-800">
+                The kit doesn&apos;t check the rest of the posting — the other questions it asks are listed
+                below for you to answer in your own words.
               </p>
             </Card>
           )}
 
           <Card>
-            <SectionTitle hint="Written from your profile text and this posting only. Quote it verbatim, or edit it — it's yours.">
+            <SectionTitle hint="Written from the facts you confirmed and this posting only. Quote it verbatim, or edit it — it's yours.">
               Cover letter
             </SectionTitle>
             <CopyBlock title="Cover letter" body={kit.coverLetter} />
           </Card>
 
           <Card>
-            <SectionTitle hint="The questions almost every application asks, answered from what you saved — and labelled when your profile has nothing on it yet.">
+            <SectionTitle hint="The questions almost every application asks, answered from facts you confirmed — and labelled when that basis isn't there.">
               Drafted answers
             </SectionTitle>
             <div className="space-y-4">
@@ -234,11 +273,21 @@ function KitPage() {
                   body={answer.answer}
                   meta={
                     <div className="flex flex-wrap items-center gap-2">
-                      {answer.missingInput ? <Badge tone="amber">Nothing saved for this yet</Badge> : null}
+                      {answer.basis === "pending" ? (
+                        <Badge tone="amber">Not confirmed yet — nothing used</Badge>
+                      ) : answer.basis === "excluded" ? (
+                        <Badge tone="amber">You excluded this — nothing used</Badge>
+                      ) : answer.basis === "missing" || answer.missingInput ? (
+                        <Badge tone="amber">Nothing confirmed for this yet</Badge>
+                      ) : null}
                       {answer.sources.length > 0 ? (
                         <span>Drawn from: {answer.sources.join("; ")}</span>
+                      ) : answer.basis === "pending" ? (
+                        <span>Drawn from: nothing you have confirmed yet</span>
+                      ) : answer.basis === "excluded" ? (
+                        <span>Drawn from: nothing — you excluded the fact for this</span>
                       ) : (
-                        <span>Drawn from: nothing in your profile yet</span>
+                        <span>Drawn from: nothing in your confirmed facts yet</span>
                       )}
                     </div>
                   }
@@ -248,18 +297,18 @@ function KitPage() {
           </Card>
 
           <Card>
-            <SectionTitle hint="Keywords the posting uses, and whether your own profile already shows them.">
+            <SectionTitle hint="Keywords the posting uses, and whether the facts you confirmed already show them.">
               Skills &amp; keyword match
             </SectionTitle>
             <div className="grid gap-5 sm:grid-cols-2">
               <div>
                 <h3 className="text-sm font-semibold text-slate-900">
-                  Your profile shows these ({kit.keywordMatch.evidenced.length})
+                  Facts you confirmed show these ({kit.keywordMatch.evidenced.length})
                 </h3>
                 <ul className="mt-3 space-y-3">
                   {kit.keywordMatch.evidenced.length === 0 ? (
                     <li className="text-sm text-slate-500">
-                      None yet — add more detail to your résumé text and roles.
+                      None yet — confirm the facts we read from your résumé text and roles.
                     </li>
                   ) : null}
                   {kit.keywordMatch.evidenced.map((hit) => (
@@ -276,7 +325,7 @@ function KitPage() {
               </div>
               <div>
                 <h3 className="text-sm font-semibold text-slate-900">
-                  The posting asks for these, your profile doesn&apos;t mention them ({kit.keywordMatch.missing.length})
+                  The posting asks for these, nothing you confirmed mentions them ({kit.keywordMatch.missing.length})
                 </h3>
                 <ul className="mt-3 space-y-2">
                   {kit.keywordMatch.missing.length === 0 ? (
@@ -291,7 +340,7 @@ function KitPage() {
                       {gap.required ? <Badge tone="red">must-have</Badge> : null}
                       <Badge tone="slate">{gap.mentions}× in posting</Badge>
                       <span className="w-full text-xs text-slate-500">
-                        Your profile doesn&apos;t mention {gap.keyword}.
+                        Nothing you have confirmed mentions {gap.keyword}.
                       </span>
                     </li>
                   ))}
@@ -339,7 +388,9 @@ function KitPage() {
 
           {kit.profileFactsUsed.length > 0 ? (
             <Card>
-              <SectionTitle hint="Everything the kit used came from here.">Facts used from your profile</SectionTitle>
+              <SectionTitle hint="One line per fact, in your own words from the review screen. What the kit does not check: the rest of the posting — the other questions it asks are listed above and need your own words.">
+                Material from your profile that the kit drew on
+              </SectionTitle>
               <ul className="space-y-1.5 text-sm text-slate-600">
                 {kit.profileFactsUsed.map((fact) => (
                   <li key={fact}>• {fact}</li>

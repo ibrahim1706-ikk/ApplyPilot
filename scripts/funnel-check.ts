@@ -40,7 +40,10 @@
  *
  *   G. THE PROFILE-COMPLETE THRESHOLD IS THE DOCUMENTED ONE
  *      Name plus material to write from; a name alone and a two-line résumé do not
- *      count; the number matches the kit generator's own completeness rule.
+ *      count; and the number lives in exactly one place in the product (the kit no
+ *      longer measures the vault by text length — it is built from confirmed facts,
+ *      so the two are deliberately different measures now; see the decision in place
+ *      beside the assertion).
  *
  *   H. FIRST-PARTY ONLY
  *      No network call, no analytics vendor, no SQL outside the storage module.
@@ -581,14 +584,28 @@ check(
   PROFILE_COMPLETE_RULE.length > 120 && /full name/.test(PROFILE_COMPLETE_RULE) && /résumé/.test(PROFILE_COMPLETE_RULE),
   PROFILE_COMPLETE_RULE
 );
-const generateSource = source("server/generate.ts");
+// DECISION, IN PLACE. This assertion used to require the kit generator to contain the
+// same `profile.resume_text.trim().length > 40` test, so the funnel step and the kit
+// would mean the same thing by "complete". The kit no longer measures the vault by
+// text length at all — it is built from the facts the user CONFIRMED, and
+// `scripts/kit-provenance-check.ts` pins that (K-gate, plus a source scan that fails
+// if a raw vault field read comes back into the generator). The kit is right: what a
+// kit may state is confirmations, not characters. The funnel step is right too: it is
+// recorded when the vault is saved, before any fact has been read or confirmed, so a
+// vault measure is what that step can honestly record.
+// The two are therefore deliberately different measures, and the invariant that
+// replaces the old one is that the number lives in exactly ONE place — this module —
+// and no other file in the product decides anything from the length of résumé text.
+const resumeThresholdFiles = SOURCES.filter((file) => /resume_text[\s\S]{0,40}length\s*>/.test(file.text)).map(
+  (file) => file.rel
+);
 check(
-  `the number is the kit generator's own completeness rule, not a second opinion (RESUME_TEXT_MIN_CHARS = ${String(RESUME_TEXT_MIN_CHARS)})`,
-  generateSource.includes(`profile.resume_text.trim().length > ${String(RESUME_TEXT_MIN_CHARS)}`) &&
-    source("server/funnel.ts").includes(
-      "profile.resume_text.trim().length > RESUME_TEXT_MIN_CHARS"
-    ),
-  "the funnel threshold and the kit's completeness check have drifted apart"
+  `the résumé-length threshold lives in exactly one place — this one (RESUME_TEXT_MIN_CHARS = ${String(RESUME_TEXT_MIN_CHARS)})`,
+  resumeThresholdFiles.length === 1 &&
+    resumeThresholdFiles[0] === "server/funnel.ts" &&
+    source("server/funnel.ts").includes("profile.resume_text.trim().length > RESUME_TEXT_MIN_CHARS") &&
+    !/resume_text[\s\S]{0,40}length\s*>/.test(source("server/generate.ts")),
+  `files deciding on résumé length: ${JSON.stringify(resumeThresholdFiles)}`
 );
 
 // =========================================================================== H ===

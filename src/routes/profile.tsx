@@ -177,8 +177,9 @@ function ProfileForm({
         />
         {form.resume_text.trim() ? (
           <p className="mt-2 text-xs text-slate-500">
-            {form.resume_text.trim().length.toLocaleString()} characters. This is what every kit is built from —
-            check it against your original file and fix anything that came out wrong.
+            {form.resume_text.trim().length.toLocaleString()} characters. We read the facts in it from here, and a
+            kit uses only the ones you confirm — check it against your original file and fix anything that came
+            out wrong.
           </p>
         ) : null}
       </Card>
