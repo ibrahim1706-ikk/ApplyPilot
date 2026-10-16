@@ -2264,8 +2264,35 @@ function missingRequired(category: FactCategory, fields: Record<string, string>)
   return !fields.value;
 }
 
+/**
+ * Does this new decision replace an earlier one the user made about the same
+ * thing? A decision is about a VALUE in a category — that is what `valueKey`
+ * carries — while the fact's id is tied to the line of material it came from. So
+ * when the material moves under a decision, the next decision the user makes is
+ * written under the fact's NEW id and the earlier one keeps the old id.
+ *
+ * Leaving that earlier decision behind is what put an excluded fact back into an
+ * answer: `applyDecisions` binds one decision per fact row (by id first), so the
+ * older decision had nothing to attach to, was treated as a decision standing on
+ * its own, and was revived as a SECOND fact with the same value — excluded on one
+ * row and answering the field from the other. It also grew the record by one
+ * stale decision per decision for every résumé edit that shifted a line.
+ *
+ * A fact the user added themselves (`action: "add"`) is their own record, and no
+ * decision about what we read may drop it.
+ */
+function supersedes(existing: FactDecision, decision: FactDecision): boolean {
+  if (existing.id === decision.id) return false;
+  if (decision.action === "add" || existing.action === "add") return false;
+  if (decision.valueKey === "" || existing.valueKey !== decision.valueKey) return false;
+  return existing.category === decision.category;
+}
+
 function upsert(decisions: FactDecision[], decision: FactDecision): FactDecision[] {
-  return [...decisions.filter((existing) => existing.id !== decision.id), decision];
+  return [
+    ...decisions.filter((existing) => existing.id !== decision.id && !supersedes(existing, decision)),
+    decision,
+  ];
 }
 
 /** Finds the fact a decision is about: in the current material, or in the record. */

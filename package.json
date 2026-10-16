@@ -12,6 +12,7 @@
     "backup": "bun run scripts/backup.ts",
     "restore-check": "bun run scripts/restore-check.ts",
     "account-check": "bun run scripts/account-check.ts",
+    "field-review-check": "bun run scripts/field-review-check.ts",
     "format": "prettier --write ."
   },
   "dependencies": {

@@ -52,6 +52,14 @@
  *      route that owns it; the answers screen instruments nothing and speaks no
  *      SQL; and the sponsorship promise that was not true of this layer is gone.
  *
+ * One ENGINE fix came out of writing these checks, and the suite pins it: a
+ * decision is about a VALUE, so a new decision supersedes an earlier decision
+ * about the same value. Without that, a confirmation made before the material
+ * moved and an exclusion made after it both stood; only one of them can bind to
+ * the fact row, so the other was revived as a SECOND fact with the same value —
+ * which is how a value the user had excluded came back inside an answer
+ * (AC-14, AC-15(b)), and how the record grew one stale decision per edit.
+ *
  * Non-vacuity: every criterion the brief names must actually have been exercised,
  * all 17 fields must appear, and an empty run fails. Exits non-zero on any failure.
  * Run: `bun run scripts/field-review-check.ts`
@@ -1108,6 +1116,24 @@ criterion(
     excludedListed: certsAfterExclude.excluded.map((source) => source.factValue),
   })
 );
+// The value being absent from the answer is not enough on its own: it must not be
+// present as a SECOND row either. The exclusion is written under the fact's
+// current id while the confirmation it replaces may keep an older one (the
+// material moved under it), and a decision left with nothing to attach to is
+// revived as a fact of its own — which is exactly how an excluded value came back
+// into an answer.
+const certRowsCarryingExcluded = q
+  .ensureFacts(user.id)
+  .facts.filter((fact) => fact.category === "certification" && fact.value === certToExclude);
+criterion(
+  "AC-14",
+  "…and the excluded value is carried by exactly one row, the excluded one — it is not revived beside itself",
+  certRowsCarryingExcluded.length === 1 && certRowsCarryingExcluded[0]!.status === "excluded",
+  JSON.stringify({
+    rows: certRowsCarryingExcluded.map((fact) => [fact.id, fact.status, fact.sourceGone ?? false]),
+    answer: certsAfterExclude.answer,
+  })
+);
 
 // AC-15(b) — the material replaced so the fact is gone entirely.
 db.saveProfile(user.id, { ...richProfile("Nothing here resembles a CV at all."), salary_expectation: "$140,000 plus super" });
@@ -1129,10 +1155,18 @@ criterion(
 );
 criterion(
   "AC-15",
-  "(b) a fact the user excluded stays excluded when the material comes back empty",
+  "(b) a fact the user excluded stays excluded when the material comes back empty — and the exclusion is the only row left carrying that value",
   !answerOf(afterWipe, "certifications").answer.includes(certToExclude) &&
-    (wipedFacts.find((fact) => fact.id === certFact.id)?.status ?? "gone") !== "confirmed",
-  JSON.stringify({ certifications: answerOf(afterWipe, "certifications").status })
+    (wipedFacts.find((fact) => fact.id === certFact.id)?.status ?? "gone") !== "confirmed" &&
+    wipedFacts.filter((fact) => fact.category === "certification" && fact.value === certToExclude).length === 1 &&
+    wipedFacts.some(
+      (fact) => fact.category === "certification" && fact.value === certToExclude && fact.status === "excluded"
+    ),
+  JSON.stringify({
+    certifications: answerOf(afterWipe, "certifications").status,
+    answer: answerOf(afterWipe, "certifications").answer,
+    rows: wipedFacts.filter((fact) => fact.category === "certification").map((fact) => [fact.value, fact.status]),
+  })
 );
 const keptSurvivor = wipedFacts.find((fact) => fact.category === "education" && fact.origin === "extracted");
 criterion(
@@ -1142,7 +1176,12 @@ criterion(
   JSON.stringify({ kept: keptSurvivor?.status })
 );
 
-// AC-13 — on a fresh account, so the counts start from zero.
+// AC-13 — on a fresh account, so the counts start from zero. One assertion per
+// action: what that action may do to the record, and nothing more. The brief's
+// wording ("each action writes at most one decision") is pinned per action,
+// because the actions are not the same kind of write: keep/correct/add write a
+// decision, while RESTORE takes one away — it is the undo, and an undo that added
+// a decision would leave the decision it was undoing in force.
 const dup = db.createUser("field-review-dup@example.com", "not-a-real-hash");
 db.saveProfile(dup.id, richProfile());
 const dupCount = (): number => {
@@ -1150,31 +1189,94 @@ const dupCount = (): number => {
   return stored ? (JSON.parse(stored.decisions_json) as unknown[]).length : 0;
 };
 const dupPhone = q.ensureFacts(dup.id).facts.find((fact) => fact.label === IDENTITY_FACT_LABELS.phone)!;
-const steps: number[] = [dupCount()];
+const dupSkill = q.ensureFacts(dup.id).facts.find((fact) => fact.category === "skill")!;
+
+const dupStart = dupCount();
 q.keepFact(dup.id, dupPhone.id);
-steps.push(dupCount());
+const dupAfterKeep = dupCount();
 q.keepFact(dup.id, dupPhone.id);
-steps.push(dupCount());
-q.correctFact(dup.id, dupPhone.id, { value: "0400 000 000" });
-steps.push(dupCount());
-db.saveProfile(dup.id, richProfile("A DIFFERENT FIRST LINE\n" + plain));
-const dupPhoneAgain = q.ensureFacts(dup.id).facts.find((fact) => fact.label === IDENTITY_FACT_LABELS.phone)!;
-q.restoreFact(dup.id, dupPhoneAgain.id);
-steps.push(dupCount());
-const firstAdd = q.addFact(dup.id, "identity", { value: "jordan.blake@example.com" }, "my work address", "email");
-steps.push(dupCount());
-const secondAdd = q.addFact(dup.id, "identity", { value: "jordan.blake@example.com" }, "my work address", "email");
-steps.push(dupCount());
-const deltas = steps.slice(1).map((value, index) => value - steps[index]!);
+const dupAfterSecondKeep = dupCount();
 criterion(
   "AC-13",
-  "keep, correct, restore and add each write at most one decision — and a duplicate add writes none and is refused",
-  deltas.every((delta) => delta >= 0 && delta <= 1) &&
-    firstAdd.ok === true &&
+  "keeping a fact writes one decision, and keeping a fact that is already kept writes nothing at all",
+  dupStart === 0 && dupAfterKeep === dupStart + 1 && dupAfterSecondKeep === dupAfterKeep,
+  JSON.stringify({ dupStart, dupAfterKeep, dupAfterSecondKeep })
+);
+
+const dupBeforeCorrect = dupCount();
+const dupCorrection = q.correctFact(dup.id, dupPhone.id, { value: "0400 000 000" });
+const dupAfterCorrect = dupCount();
+criterion(
+  "AC-13",
+  "correcting a fact replaces its own decision rather than stacking a second one",
+  dupCorrection.ok && dupAfterCorrect - dupBeforeCorrect >= 0 && dupAfterCorrect - dupBeforeCorrect <= 1,
+  JSON.stringify({ dupBeforeCorrect, dupAfterCorrect })
+);
+
+// The restore, with an UNRELATED decision made just before it: a restore must take
+// away exactly the decision it undoes and leave the rest of the record alone.
+q.keepFact(dup.id, dupSkill.id);
+const dupBeforeRestore = dupCount();
+const phoneAnswerBeforeRestore = answerOf(fieldAnswersFor(dup.id), "phone");
+db.saveProfile(dup.id, richProfile("A DIFFERENT FIRST LINE\n" + plain));
+const dupPhoneAgain = q.ensureFacts(dup.id).facts.find((fact) => fact.label === IDENTITY_FACT_LABELS.phone)!;
+const dupRestore = q.restoreFact(dup.id, dupPhoneAgain.id);
+const dupAfterRestore = dupCount();
+const phoneAnswerAfterRestore = answerOf(fieldAnswersFor(dup.id), "phone");
+const skillDecisionSurvived = q
+  .ensureFacts(dup.id)
+  .decisions.some((decision) => decision.id === dupSkill.id && decision.action === "keep");
+criterion(
+  "AC-13",
+  "restoring a fact takes back exactly its own decision — the record shrinks by one, the unrelated decision stays, and the fact returns to a suggestion rather than staying confirmed",
+  dupRestore.ok &&
+    dupAfterRestore === dupBeforeRestore - 1 &&
+    skillDecisionSurvived &&
+    phoneAnswerBeforeRestore.answer === "0400 000 000" &&
+    phoneAnswerAfterRestore.status === "pending" &&
+    phoneAnswerAfterRestore.answer === "",
+  JSON.stringify({
+    dupBeforeRestore,
+    dupAfterRestore,
+    skillDecisionSurvived,
+    before: [phoneAnswerBeforeRestore.status, phoneAnswerBeforeRestore.answer],
+    after: [phoneAnswerAfterRestore.status, phoneAnswerAfterRestore.answer],
+  })
+);
+
+const firstAdd = q.addFact(dup.id, "identity", { value: "jordan.blake@example.com" }, "my work address", "email");
+const afterFirstAdd = dupCount();
+const secondAdd = q.addFact(dup.id, "identity", { value: "jordan.blake@example.com" }, "my work address", "email");
+const afterSecondAdd = dupCount();
+criterion(
+  "AC-13",
+  "adding a missing detail writes one decision, and adding the same detail twice is refused with nothing written",
+  firstAdd.ok === true &&
+    afterFirstAdd === dupAfterRestore + 1 &&
     secondAdd.ok === false &&
-    deltas[5] === 1 &&
-    deltas[6] === 0,
-  JSON.stringify({ steps, deltas, firstAdd: firstAdd.ok, secondAdd: secondAdd.ok })
+    afterSecondAdd === afterFirstAdd,
+  JSON.stringify({ afterRestore: dupAfterRestore, afterFirstAdd, afterSecondAdd, firstAdd: firstAdd.ok, secondAdd: secondAdd.ok })
+);
+
+// The invariant behind all of the above: one live decision per value in a
+// category. Two decisions about the same value is what put an excluded fact back
+// into an answer (AC-14 above), because only one of them can bind to the fact row
+// and the other is then revived as a second fact with the same value.
+const duplicateDecisionKeys = (userId: string): string[] => {
+  const seen = new Set<string>();
+  const duplicates: string[] = [];
+  for (const decision of q.ensureFacts(userId).decisions) {
+    const key = `${decision.category}|${decision.valueKey}`;
+    if (seen.has(key)) duplicates.push(key);
+    seen.add(key);
+  }
+  return duplicates;
+};
+criterion(
+  "AC-13",
+  "no value in a category ever has two decisions standing at once — the record does not accumulate a stale copy of each decision",
+  duplicateDecisionKeys(dup.id).length === 0 && duplicateDecisionKeys(user.id).length === 0,
+  JSON.stringify({ dup: duplicateDecisionKeys(dup.id), account: duplicateDecisionKeys(user.id) })
 );
 
 // =========================================================================== E3 ===
@@ -1317,6 +1419,57 @@ const profileSource = readFileSync(join(SRC, "routes", "profile.tsx"), "utf8");
 const reviewSource = readFileSync(join(SRC, "routes", "qualifications.tsx"), "utf8");
 const answersSource = readFileSync(join(SRC, "routes", "answers.tsx"), "utf8");
 const engineSource = readFileSync(join(SRC, "server", "field-answers.ts"), "utf8");
+
+/**
+ * A source file with its comments taken out.
+ *
+ * A check about what the layer SAYS TO A USER must not be tripped by a note to
+ * the next reader. When the sponsorship promise was removed, the honest thing to
+ * leave behind was a comment recording the removed sentence and why it was wrong
+ * — and a scan of the raw text then fails on the very evidence that the removal
+ * happened. Strings are copied through untouched (they are what can reach a
+ * user); `//` and block comments are dropped.
+ */
+function stripComments(source: string): string {
+  let out = "";
+  let index = 0;
+  while (index < source.length) {
+    const char = source[index]!;
+    const next = source[index + 1];
+    if (char === "/" && next === "/") {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      index += 2;
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) index += 1;
+      index += 2;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      const quote = char;
+      out += char;
+      index += 1;
+      while (index < source.length) {
+        const inner = source[index]!;
+        out += inner;
+        if (inner === "\\") {
+          out += source[index + 1] ?? "";
+          index += 2;
+          continue;
+        }
+        index += 1;
+        if (inner === quote) break;
+      }
+      continue;
+    }
+    out += char;
+    index += 1;
+  }
+  return out;
+}
+
+const engineCode = stripComments(engineSource);
 const profileAnchors = new Set([...profileSource.matchAll(/id="([^"]+)"/g)].map((match) => match[1] ?? ""));
 const reviewAddTemplate = reviewSource.includes("id={`add-${category}`}");
 
@@ -1389,9 +1542,34 @@ criterion(
 
 criterion(
   "AC-21",
-  "the promise that a vault note “can be used next time” is gone from the answering layer",
-  !/can be used next time/.test(engineSource) && !/work_authorisation_note/.test(engineSource),
-  "the answering layer still mentions the work-authorisation note"
+  "the promise that a vault note “can be used next time” is gone from the answering layer — the CODE, not the comments that record what was removed",
+  !/can be used next time/.test(engineCode) && !/work_authorisation_note/.test(engineCode),
+  "the answering layer still mentions the work-authorisation note in code"
+);
+const emittedCopy = [
+  ...nudgeSets.flatMap((set) =>
+    set.answers.flatMap((answer) => [
+      answer.notCovered,
+      answer.caveat,
+      answer.pendingNote,
+      answer.answer,
+      answer.nudge?.text ?? "",
+      answer.nudge?.action ?? "",
+    ])
+  ),
+  ...WORK_AUTHORISATION_OPTIONS.flatMap((option) =>
+    fieldAnswersFromFacts(confirmedSet(factsFor({ ...richProfile(), work_authorisation: option }))).answers.flatMap(
+      (answer) => [answer.notCovered, answer.caveat, answer.pendingNote, answer.answer]
+    )
+  ),
+].join("\n");
+criterion(
+  "AC-21",
+  "…and no wording the engine can emit for any field carries it either — the copy is what reaches a user",
+  !/can be used next time/i.test(emittedCopy) &&
+    !/put your wording in/i.test(emittedCopy) &&
+    !/can be used/i.test(emittedCopy),
+  JSON.stringify(emittedCopy.split("\n").filter((line) => /can be used/i.test(line)).slice(0, 3))
 );
 const settledCopy = unsettledNudge.notCovered;
 criterion(
