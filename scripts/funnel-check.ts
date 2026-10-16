@@ -481,7 +481,11 @@ check(
   /five steps/i.test(privacySource) &&
     /no IP address/i.test(privacySource) &&
     /no third-party analytics/i.test(privacySource) &&
-    /funnel steps recorded for your account/i.test(privacySource),
+    // The page really does say "The funnel steps recorded for your account … are
+    // deleted with it" (`privacy.tsx:237`); the sentence is wrapped across two JSX
+    // lines, so this allows whitespace rather than one literal space. The
+    // assertion itself is unchanged — the page must say it, in these words.
+    /funnel steps recorded\s+for your account/i.test(privacySource),
   "privacy.tsx no longer describes the funnel steps"
 );
 

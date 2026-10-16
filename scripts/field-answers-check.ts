@@ -574,10 +574,19 @@ for (const [option, expected] of sponsorshipExpectation) {
 const limitedRights = fieldAnswersFromFacts(
   confirmedSet(factsFor({ ...db.EMPTY_PROFILE, resume_text: plain, work_authorisation: WORK_AUTHORISATION_OPTIONS[2] }))
 );
+// The nudge here used to point at the vault's work-authorisation NOTE. That was
+// the overreach the per-field work removed: this layer never reads the note, so
+// sending the user there invited them to write wording that nothing would use.
+// It now points at the work-rights ANSWER, the one thing in the vault that can
+// settle the question — and the copy says so. The substance of this check is
+// unchanged: the case is explained rather than read as yes or no, it carries a
+// real nudge, and section F verifies that every nudge hash is an element the page
+// really has.
 check(
   "the limited-work-rights answer is explained rather than read as “no” (or as “yes”)",
   /limited work rights/.test(answerOf(limitedRights, "sponsorship").notCovered) &&
-    answerOf(limitedRights, "sponsorship").nudge?.hash === "work-authorisation-note",
+    answerOf(limitedRights, "sponsorship").nudge?.hash === "work-authorisation" &&
+    !/can be used next time|can be used/i.test(answerOf(limitedRights, "sponsorship").notCovered),
   JSON.stringify(answerOf(limitedRights, "sponsorship").notCovered)
 );
 const resumeRightsOnly = fieldAnswersFromFacts(confirmedSet(factsFor({ ...db.EMPTY_PROFILE, resume_text: plain })));

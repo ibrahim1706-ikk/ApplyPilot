@@ -691,7 +691,9 @@ export const restoreFact = createServerFn({ method: "POST" })
  * one.
  */
 export const addFact = createServerFn({ method: "POST" })
-  .validator((input: { category?: unknown; fields?: unknown; note?: unknown }) => input)
+  .validator(
+    (input: { category?: unknown; fields?: unknown; note?: unknown; forField?: unknown }) => input
+  )
   .handler(async ({ data }): Promise<Result> => {
     const user = currentUser();
     if (!user) return { ok: false, error: NOT_SIGNED_IN };
@@ -699,7 +701,12 @@ export const addFact = createServerFn({ method: "POST" })
     if (!category || category === "overall") {
       return { ok: false, error: "Choose which part of your qualifications this belongs to." };
     }
-    return runDecision(() => qualifications.addFact(user.id, category, data?.fields, data?.note));
+    // `forField` names the application field the detail was added for, so a fact
+    // added for one of the nine identity-backed fields is stored under that
+    // field's own label and actually answers it.
+    return runDecision(() =>
+      qualifications.addFact(user.id, category, data?.fields, data?.note, data?.forField)
+    );
   });
 
 /**
