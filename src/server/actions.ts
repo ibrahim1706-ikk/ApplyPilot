@@ -1043,7 +1043,9 @@ export const createApplication = createServerFn({ method: "POST" })
       postingText: text,
     });
 
-    const kit = generateKit({ profile: db.getProfile(user.id), application });
+    // The kit is built from the facts the user has CONFIRMED, exactly the set the
+    // answers screen answers from — it has no view of the raw vault at all.
+    const kit = generateKit({ facts: qualifications.ensureFacts(user.id).facts, application });
     db.saveKit(user.id, application.id, JSON.stringify(kit));
     // Funnel steps 3 and 4 of 5 — the posting is saved and a kit exists for it,
     // both because of this action and nothing else.
@@ -1129,7 +1131,8 @@ export const regenerateKit = createServerFn({ method: "POST" })
 
     const updated = db.getApplication(user.id, application.id);
     if (!updated) return { ok: false, error: "That application isn't in your account." };
-    const kit = generateKit({ profile: db.getProfile(user.id), application: updated });
+    // Rebuilt from the same confirmed fact set the answers screen answers from.
+    const kit = generateKit({ facts: qualifications.ensureFacts(user.id).facts, application: updated });
     db.saveKit(user.id, application.id, JSON.stringify(kit));
     // Still step 4 of 5: rebuilding a kit does not add a second event.
     recordStep(user.id, "kit_generated");

@@ -14,8 +14,19 @@
  * The MVP runs with zero API keys: keyword extraction, matching, and the
  * templates below are all deterministic. There is no model call anywhere.
  */
-import type { Application, Profile } from "~/db";
-import type { Kit, KitAnswer, KitGap, KeywordGap, KeywordHit, KeywordMatch } from "~/types";
+import type { Application } from "~/db";
+import { fieldAnswersFromFacts } from "~/server/field-answers";
+import type {
+  AnswerFieldKey,
+  Fact,
+  FieldAnswer,
+  Kit,
+  KitAnswer,
+  KitGap,
+  KeywordGap,
+  KeywordHit,
+  KeywordMatch,
+} from "~/types";
 
 // ------------------------------------------------------------------ utilities ---
 
@@ -81,6 +92,7 @@ function segments(text: string): string[] {
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
 }
+
 
 function truncate(value: string, max: number): string {
   const clean = value.replace(/\s+/g, " ").trim();
@@ -829,103 +841,201 @@ function extractYearsRequirement(posting: string): number | null {
   return Number.isFinite(years) && years > 0 && years < 40 ? years : null;
 }
 
-// ------------------------------------------------------------- profile mining ---
+// --------------------------------------------------- the confirmed fact set ---
+//
+// Everything the kit is allowed to say about the user is here, and nowhere else.
+//
+// The kit used to read the raw vault and the résumé text directly (`db.getProfile`
+// → `profileCorpus`), which meant a fact the user had EXCLUDED on the review screen
+// was still stated in the letter, and a vault value they had never confirmed was
+// quoted as settled. The kit is the artefact people copy into a real application
+// form, so it now answers by the same standard as the answers screen: it is built
+// from `fieldAnswersFromFacts`, from facts with `status === "confirmed"` restated
+// in the user's own words, and where it would otherwise have used something else it
+// says so and points at the review screen.
+//
+// Two invariants hold, and `scripts/kit-provenance-check.ts` fails if either breaks:
+//
+//   1. A fact whose status is not "confirmed" is never restated as the user's, and
+//      its value never appears anywhere in the kit — not in the letter, not in a
+//      drafted answer, not in a gap.
+//   2. Everything the kit draws on is registered in `profileFactsUsed` by the code
+//      that uses it, and nothing else is listed: the panel is exactly the facts the
+//      kit drew on, no more and no less.
+//
+// There is deliberately no `profile` parameter. A raw profile is not something this
+// module can be handed any more, so there is no path back to the leak.
 
-function profileCorpus(profile: Profile): string {
-  const experience = profile.experience
-    .map((entry) => [entry.title, entry.company, entry.start, entry.end, entry.description].join(" "))
-    .join("\n");
-  const education = profile.education
-    .map((entry) => [entry.qualification, entry.school, entry.dates, entry.details].join(" "))
-    .join("\n");
-  return [
-    profile.resume_text,
-    experience,
-    education,
-    profile.work_authorisation,
-    profile.work_authorisation_note,
-    profile.location,
-  ]
-    .filter(Boolean)
-    .join("\n");
+/** A fact the kit drew on, named the way the panel at the bottom of the kit names it. */
+type UsedFact = { id: string; label: string; value: string };
+
+function usedFrom(source: { factId: string; factLabel: string; factValue: string }): UsedFact {
+  return { id: source.factId, label: source.factLabel, value: source.factValue };
 }
 
-function evidenceFor(lines: { raw: string; canon: string }[], skill: Skill): string {
-  for (const line of lines) {
-    if (containsKeyword(line.canon, skill.aliases)) return truncate(line.raw, 220);
+/** One line of the panel: the fact's own label and its own words, nothing added. */
+function usedLine(fact: UsedFact): string {
+  return `${fact.label}: ${fact.value}`;
+}
+
+/**
+ * The state a drafted answer is in, taken from the fields it was built from: a
+ * confirmed fact, material that is still unconfirmed, material the user excluded,
+ * or nothing at all. The kit screen's badge reads this and nothing else.
+ */
+function basisOf(...answers: FieldAnswer[]): KitAnswer["basis"] {
+  if (answers.some((answer) => answer.status === "answered")) return "confirmed";
+  if (answers.some((answer) => answer.pending.length > 0)) return "pending";
+  if (answers.some((answer) => answer.excluded.length > 0)) return "excluded";
+  return "missing";
+}
+
+/** The "Drawn from:" lines for one answer: the facts behind it, named. */
+function sourcesOf(answer: FieldAnswer): string[] {
+  return answer.sources.map((source) => `${source.factLabel}: ${source.factValue}`);
+}
+
+/**
+ * What the kit says about something it draws on but may not state. Three cases, and
+ * the third is the only one where the material has nothing at all:
+ *
+ *  - unconfirmed — the material covers it, the user hasn't confirmed it, so it stays
+ *    out and the link goes to the review screen, exactly as the answers screen does;
+ *  - excluded — the user took it out on the review screen, so it stays out, and
+ *    nothing is put back on their behalf;
+ *  - not covered — nothing in the material covers it at all, so the kit reuses the
+ *    answers engine's own nudge, which points at the exact place the detail belongs.
+ *
+ * Null means the field is answered: there is nothing to warn about.
+ */
+function wantedGap(answer: FieldAnswer, subject: string): KitGap | null {
+  if (answer.status === "answered") return null;
+  if (answer.pending.length > 0) {
+    return {
+      text: `The kit would have used ${subject}, but nothing you have confirmed covers it, so it stays out. Confirm it on the review screen and rebuild this kit.`,
+      action: "Review and confirm your facts",
+      where: "qualifications",
+      hash: "",
+    };
   }
-  return "";
-}
-
-function isCurrent(end: string): boolean {
-  return /present|current|now|ongoing|today/i.test(end);
-}
-
-function dateRange(start: string, end: string): string {
-  const bits = [start.trim(), end.trim()].filter(Boolean);
-  if (bits.length === 0) return "";
-  return bits.join("–");
-}
-
-/** Union of the year ranges in the profile's experience entries (rough estimate). */
-function estimateExperienceYears(experience: Profile["experience"], currentYear: number): number {
-  const intervals: [number, number][] = [];
-  for (const entry of experience) {
-    const years = `${entry.start} ${entry.end}`.match(/\b(19|20)\d{2}\b/g);
-    if (!years || years.length === 0) continue;
-    const start = Number.parseInt(years[0] ?? "", 10);
-    const endRaw = years[years.length - 1] ?? "";
-    const end = isCurrent(entry.end) || years.length === 1 ? currentYear : Number.parseInt(endRaw, 10);
-    if (Number.isFinite(start) && Number.isFinite(end) && end >= start) intervals.push([start, end]);
+  if (answer.excluded.length > 0) {
+    return {
+      text: `You excluded the fact behind ${subject} on the review screen, so the kit leaves it out — nothing is put back without you.`,
+      action: "Bring it back on the review screen",
+      where: "qualifications",
+      hash: "",
+    };
   }
-  if (intervals.length === 0) return 0;
-  intervals.sort((a, b) => a[0] - b[0]);
-  let total = 0;
-  let [start, end] = intervals[0] ?? [0, 0];
-  for (const [nextStart, nextEnd] of intervals.slice(1)) {
-    if (nextStart <= end + 1) {
-      end = Math.max(end, nextEnd);
-    } else {
-      total += end - start;
-      start = nextStart;
-      end = nextEnd;
-    }
+  const nudge = answer.nudge;
+  if (!nudge) return null;
+  return { text: nudge.text, action: nudge.action, where: nudge.where, hash: nudge.hash };
+}
+
+/** The subjects the kit writes from, and what it calls each one in a gap. */
+const KIT_SUBJECTS: Array<{ key: AnswerFieldKey; subject: string; always: boolean }> = [
+  { key: "full_name", subject: "your name", always: false },
+  { key: "email", subject: "your email address", always: false },
+  { key: "phone", subject: "your phone number", always: false },
+  { key: "location", subject: "where you are based", always: false },
+  { key: "portfolio", subject: "your portfolio link", always: false },
+  { key: "github", subject: "your GitHub link", always: false },
+  { key: "linkedin", subject: "your LinkedIn link", always: false },
+  // The four the kit cannot write its letter or its answers without: a gap appears
+  // even when the material is silent, not only when the user hasn't confirmed it.
+  { key: "current_role", subject: "your most recent role", always: true },
+  { key: "education", subject: "your education", always: false },
+  { key: "skills", subject: "your skills and tools", always: false },
+  { key: "salary_expectation", subject: "your salary expectation", always: true },
+  { key: "notice_period", subject: "your notice period", always: true },
+  { key: "work_rights", subject: "your work authorisation status", always: true },
+  { key: "years_experience", subject: "how many years of experience you have", always: false },
+];
+
+/** The three states a drafted answer can be in, in the kit's own words. */
+type KitAnswerBasis = KitAnswer["basis"];
+
+/**
+ * One drafted answer built from the answers engine's own field answer — the same
+ * value, the same "not confirmed yet" and "you excluded this" states, the same place
+ * to fix it. The kit has no second opinion about any of these.
+ */
+function draftedFrom(
+  answer: FieldAnswer,
+  wording: { confirmed: (value: string) => string; subject: string; missing: string }
+): { text: string; basis: KitAnswerBasis } {
+  if (answer.status === "answered") return { text: wording.confirmed(answer.answer), basis: "confirmed" };
+  if (answer.pending.length > 0) {
+    return {
+      text: `Nothing you've confirmed states ${wording.subject} yet. Your material covers it, and the kit won't state it until you confirm it on the review screen — then rebuild this kit.`,
+      basis: "pending",
+    };
   }
-  total += end - start;
-  return total;
+  if (answer.excluded.length > 0) {
+    return {
+      text: `You excluded the fact behind ${wording.subject} on the review screen, so the kit doesn't state it. Bring it back there if it should be used.`,
+      basis: "excluded",
+    };
+  }
+  return { text: wording.missing, basis: "missing" };
 }
 
 // ------------------------------------------------------------------- the kit ---
 
 export type GenerateInput = {
-  profile: Profile;
+  /**
+   * The account's facts with the user's own decisions applied — exactly what the
+   * answers screen answers from (`qualifications.ensureFacts`). There is no raw
+   * profile in this input on purpose: the kit has no other view of the user.
+   */
+  facts: Fact[];
   application: Pick<Application, "title" | "company" | "url" | "posting_text">;
   now?: Date;
 };
 
-export function generateKit({ profile, application, now = new Date() }: GenerateInput): Kit {
+export function generateKit({ facts, application, now = new Date() }: GenerateInput): Kit {
   const posting = application.posting_text ?? "";
-  const corpus = profileCorpus(profile);
+  const set = fieldAnswersFromFacts(facts);
+  const confirmedFacts = facts.filter((fact) => fact.status === "confirmed");
+  const nothingConfirmed = confirmedFacts.length === 0;
+
+  const fieldAnswer = (key: AnswerFieldKey): FieldAnswer => {
+    const found = set.answers.find((answer) => answer.field === key);
+    if (!found) throw new Error(`the answers engine has no field ${key}`);
+    return found;
+  };
+  const isAnswered = (key: AnswerFieldKey): boolean => fieldAnswer(key).status === "answered";
+  const valueOf = (key: AnswerFieldKey): string => (isAnswered(key) ? fieldAnswer(key).answer : "");
+
+  // -- what the kit drew on ----------------------------------------------------
+  // Every use of a fact goes through `use`, which is what makes the panel at the
+  // bottom of the kit screen exactly what it claims to be.
+  const used: UsedFact[] = [];
+  function use(source: { factId: string; factLabel: string; factValue: string }): void {
+    if (!used.some((entry) => entry.id === source.factId)) used.push(usedFrom(source));
+  }
+  /** Registers every fact an answer was built from, and hands the answer back. */
+  function useAnswer(answer: FieldAnswer): FieldAnswer {
+    for (const source of answer.sources) use(source);
+    return answer;
+  }
+
   const hints = readPostingHints(posting, application.url);
   const roleTitle = application.title.trim() || hints.title || "";
   const company = application.company.trim() || hints.company || "";
   const gaps: KitGap[] = [];
-  const factsUsed: string[] = [];
 
-  const currentYear = now.getFullYear();
-  const experienceYears = estimateExperienceYears(profile.experience, currentYear);
-  const latest = profile.experience[0] ?? null;
-
-  // -- keyword match -----------------------------------------------------------
-  // Both sides are canonicalised once, then matched whole-token: wording,
-  // apostrophes, hyphens and simple plurals stop mattering, while a keyword the
-  // profile genuinely doesn't evidence still shows up as a gap.
-  const postingSegments = segments(posting);
-  const requiredSegments = postingSegments.filter((s) => REQUIREMENT_WORDS.test(s));
+  // -- keyword match, against confirmed facts only -----------------------------
+  // The haystack is the confirmed facts' own text. It used to be the whole profile
+  // corpus, so a posting keyword could be "evidenced" by a résumé line whose fact the
+  // user had excluded — and the line was then quoted in the letter.
   const postingCanon = canonicalHaystack(posting);
-  const requiredCanon = canonicalHaystack(requiredSegments.join("\n"));
-  const corpusCanon = canonicalHaystack(corpus);
-  const corpusLines = segments(corpus).map((line) => ({ raw: line, canon: canonicalHaystack(line) }));
+  const requiredCanon = canonicalHaystack(
+    segments(posting)
+      .filter((s) => REQUIREMENT_WORDS.test(s))
+      .join("\n")
+  );
+  const confirmedCanon = canonicalHaystack(confirmedFacts.map((fact) => fact.value).join("\n"));
+  const factLines = confirmedFacts.map((fact) => ({ fact, canon: canonicalHaystack(fact.value) }));
 
   const scored = SKILLS.map((skill) => {
     const mentions = countKeyword(postingCanon, skill.aliases);
@@ -937,12 +1047,17 @@ export function generateKit({ profile, application, now = new Date() }: Generate
 
   const evidenced: KeywordHit[] = [];
   const missing: KeywordGap[] = [];
+  const evidenceOwner = new Map<string, Fact>();
   for (const entry of scored) {
-    const evidence = evidenceFor(corpusLines, entry.skill);
-    if (evidence) {
+    const line = factLines.find((item) => containsKeyword(item.canon, entry.skill.aliases));
+    if (line) {
+      // The evidence is the confirmed fact's own words — the whole of them, so the
+      // panel below can show the same text the kit showed.
+      use({ factId: line.fact.id, factLabel: line.fact.label, factValue: line.fact.value });
+      evidenceOwner.set(entry.skill.name, line.fact);
       evidenced.push({
         keyword: entry.skill.name,
-        evidence,
+        evidence: line.fact.value,
         mentions: entry.mentions,
         required: entry.required,
       });
@@ -959,114 +1074,89 @@ export function generateKit({ profile, application, now = new Date() }: Generate
   };
 
   // -- posting-derived checks --------------------------------------------------
+  // None of these computes anything about the user. The years check used to add up
+  // their role dates; it no longer exists anywhere in this file.
   const yearsRequired = extractYearsRequirement(posting);
-  if (yearsRequired !== null) {
-    if (experienceYears === 0) {
+  if (yearsRequired !== null && !isAnswered("years_experience")) {
+    const gap = wantedGap(fieldAnswer("years_experience"), "how many years of experience you have");
+    if (gap) {
       gaps.push({
-        text: `The posting asks for around ${yearsRequired}+ years of experience. Your profile has no dated roles yet, so nothing there evidences it.`,
-        action: "Add your roles and dates under Experience",
-        where: "profile",
-        hash: "experience",
+        ...gap,
+        text: `The posting asks for around ${String(yearsRequired)}+ years of experience. ${gap.text}`,
       });
-    } else if (experienceYears < yearsRequired) {
-      gaps.push({
-        text: `The posting asks for around ${yearsRequired}+ years of experience; the roles in your profile add up to roughly ${experienceYears} years, and the kit won't round that up.`,
-        action: "Check your roles and dates under Experience",
-        where: "profile",
-        hash: "experience",
-      });
-    } else {
-      factsUsed.push(`Experience dates add up to about ${experienceYears} years`);
     }
   }
 
-  for (const group of QUALIFICATION_GROUPS) {
-    const asked = group.askedAs.find((term) => containsKeyword(postingCanon, [term]));
-    if (!asked) continue;
-    if (containsKeyword(corpusCanon, group.satisfiedBy)) continue;
-    gaps.push({
-      text: `The posting asks for ${group.label} ("${asked}") and your profile shows nothing that satisfies it. If you have it, record it — if you don't, read that requirement carefully before applying.`,
-      action: "Add your qualification under Education & qualifications",
-      where: "profile",
-      hash: "education",
-    });
+  // A posting requirement nothing confirmed covers. Suppressed while the user has
+  // unconfirmed education facts, because the per-subject gap below already says so.
+  const education = fieldAnswer("education");
+  const educationUnsettled = education.pending.length > 0 || education.excluded.length > 0;
+  if (!educationUnsettled) {
+    for (const group of QUALIFICATION_GROUPS) {
+      const asked = group.askedAs.find((term) => containsKeyword(postingCanon, [term]));
+      if (!asked) continue;
+      if (containsKeyword(confirmedCanon, group.satisfiedBy)) continue;
+      gaps.push({
+        text: `The posting asks for ${group.label} ("${asked}") and nothing you have confirmed covers it. If you have it, record it and confirm it — if you don't, read that requirement carefully before applying.`,
+        action: "Add your qualification under Education & qualifications",
+        where: "profile",
+        hash: "education",
+      });
+    }
   }
 
   const mentionsWorkRights =
     /\b(right to work|work rights|work authorisation|work authorization|eligible to work|sponsorship|sponsor|visa)\b/i.test(
       posting
     );
-  const needsSponsorship = /sponsor/i.test(profile.work_authorisation);
-  if (mentionsWorkRights && !profile.work_authorisation) {
+  // Sponsorship is read from the answers engine's own mapping of the guaranteed
+  // work-rights answer — never from a regex over the user's wording. A "Yes" here is
+  // one the user's own chosen answer plainly settles.
+  const sponsorship = fieldAnswer("sponsorship");
+  const needsSponsorship = sponsorship.status === "answered" && sponsorship.answer.trim() === "Yes";
+  if (needsSponsorship && /(not|unable|no|without)\s+(?:able to\s+)?sponsor/i.test(posting)) {
     gaps.push({
-      text: "The posting asks about work rights and your profile has no work authorisation status saved. Nothing here guesses at it.",
-      action: "Save your work authorisation status",
-      where: "profile",
-      hash: "work-authorisation",
-    });
-  }
-  if (needsSponsorship && /sponsor/i.test(posting) && /(not|unable|no|without)\s+(?:able to\s+)?sponsor/i.test(posting)) {
-    gaps.push({
-      text: "The posting states it cannot sponsor, and your profile says you would need sponsorship. Read that carefully before applying.",
+      text: "The posting states it cannot sponsor, and the work-rights answer you confirmed says you would need sponsorship. Read that carefully before applying.",
       action: "Review your work authorisation status",
       where: "profile",
       hash: "work-authorisation",
     });
   }
 
-  // -- profile completeness ----------------------------------------------------
-  const checks: boolean[] = [
-    Boolean(profile.full_name),
-    Boolean(profile.email),
-    Boolean(profile.phone),
-    Boolean(profile.location),
-    profile.resume_text.trim().length > 40,
-    profile.experience.length > 0,
-    profile.education.length > 0,
-    Boolean(profile.work_authorisation),
-    Boolean(profile.salary_expectation),
-    Boolean(profile.notice_period),
-    Boolean(profile.portfolio_url || profile.github_url || profile.linkedin_url),
-  ];
-  const profileCompleteness = Math.round((checks.filter(Boolean).length / checks.length) * 100);
+  // -- what the kit can and cannot write from ----------------------------------
+  if (nothingConfirmed) {
+    // One clear statement rather than fourteen: with nothing confirmed there is no
+    // material in the kit at all, and that is the thing to say.
+    gaps.push({
+      text: "Nothing you have confirmed has gone into this kit. Every fact we read from your material is still waiting on the review screen — the kit writes only from facts you confirm, so there is nothing about you in it yet.",
+      action: "Review and confirm your facts",
+      where: "qualifications",
+      hash: "",
+    });
+  } else {
+    if (!confirmedFacts.some((fact) => fact.source.kind === "resume")) {
+      gaps.push({
+        text: "Nothing you have confirmed came from résumé text — the kit only had your other confirmed facts to work from.",
+        action: "Add or confirm what we read from your résumé text",
+        where: "profile",
+        hash: "resume",
+      });
+    }
+    for (const subject of KIT_SUBJECTS) {
+      const answer = fieldAnswer(subject.key);
+      if (answer.status === "answered") continue;
+      const unsettled = answer.pending.length > 0 || answer.excluded.length > 0;
+      if (!unsettled && !subject.always) continue;
+      const gap = wantedGap(answer, subject.subject);
+      if (gap) gaps.push(gap);
+    }
+  }
 
-  if (!profile.resume_text.trim()) {
+  if (missing.length > 0) {
+    const top = missing.slice(0, 8).map((entry) => entry.keyword);
     gaps.push({
-      text: "Your profile has no résumé text pasted in — the kit only had your other fields to work from.",
-      action: "Paste your résumé text",
-      where: "profile",
-      hash: "resume",
-    });
-  }
-  if (profile.experience.length === 0) {
-    gaps.push({
-      text: "Your profile lists no roles yet, so nothing here can show your work history.",
-      action: "Add your roles",
-      where: "profile",
-      hash: "experience",
-    });
-  }
-  if (!profile.salary_expectation) {
-    gaps.push({
-      text: "Salary expectation: nothing saved in your profile, so the drafted answer says so rather than guessing a number.",
-      action: "Save your salary expectation",
-      where: "profile",
-      hash: "salary",
-    });
-  }
-  if (!profile.notice_period) {
-    gaps.push({
-      text: "Notice period: nothing saved in your profile, so the drafted answer says so rather than guessing.",
-      action: "Save your notice period",
-      where: "profile",
-      hash: "notice-period",
-    });
-  }
-  if (keywordMatch.missing.length > 0) {
-    const top = keywordMatch.missing.slice(0, 8).map((entry) => entry.keyword);
-    gaps.push({
-      text: `Your profile doesn't mention: ${list(top)}. The posting asks for them, and the kit won't claim them for you.`,
-      action: "Add the real experience to your résumé text or a role",
+      text: `Nothing you have confirmed mentions: ${list(top)}. The posting asks for them, and the kit won't claim them for you.`,
+      action: "Record the real experience in your résumé text or a role, then confirm it",
       where: "profile",
       hash: "resume",
     });
@@ -1089,198 +1179,263 @@ export function generateKit({ profile, application, now = new Date() }: Generate
   }
 
   // -- cover letter ------------------------------------------------------------
-  const opening: string[] = [];
   const roleLabel = roleTitle ? roleTitle : "this role";
   const atCompany = company ? ` at ${company}` : "";
-  opening.push(
-    `I'd like to apply for the ${roleLabel}${atCompany}.${application.url ? ` (${application.url})` : ""}`
-  );
+  const greeting = company ? `Dear ${company} hiring team,` : "Dear Hiring Manager,";
 
-  if (latest) {
-    const dates = dateRange(latest.start, latest.end);
-    const verb = isCurrent(latest.end) ? "I'm currently working as" : "My most recent role was";
-    const asWhat = [latest.title, latest.company].filter(Boolean).join(" at ");
-    if (asWhat) {
-      opening.push(`${verb} ${asWhat}${dates ? ` (${dates})` : ""}.`);
-      factsUsed.push(`Experience: ${asWhat}${dates ? ` (${dates})` : ""}`);
+  let coverLetter: string;
+  if (nothingConfirmed) {
+    coverLetter = [
+      greeting,
+      "[No cover letter yet: none of the facts we read from your material has been confirmed by you, and this kit writes only from facts you confirm. Review and confirm your facts, then rebuild this kit — nothing about you has been written in the meantime.]",
+    ].join("\n\n");
+  } else {
+    const opening: string[] = [
+      `I'd like to apply for the ${roleLabel}${atCompany}.${application.url ? ` (${application.url})` : ""}`,
+    ];
+    const role = fieldAnswer("current_role");
+    if (role.status === "answered") {
+      useAnswer(role);
+      opening.push(`My most recent role is ${role.answer}.`);
     }
-  } else if (profile.resume_text.trim()) {
-    opening.push("My background is summarised in the résumé text I've kept in my ApplyPilot profile.");
-  }
+    const educationValue = valueOf("education");
+    if (educationValue) {
+      useAnswer(education);
+      opening.push(`I studied ${educationValue}.`);
+    }
 
-  const education = profile.education[0];
-  if (education && (education.qualification || education.school)) {
-    const bits = [education.qualification, education.school].filter(Boolean).join(" at ");
-    opening.push(`I studied ${bits}${education.dates ? ` (${education.dates})` : ""}.`);
-    factsUsed.push(`Education: ${bits}`);
-  }
+    const paragraphs: string[] = [opening.join(" ")];
+    const letterEvidence = evidenced.slice(0, 3);
+    if (letterEvidence.length > 0) {
+      const asked = list(letterEvidence.map((entry) => entry.keyword));
+      const quotes = letterEvidence.map((entry) => `"${entry.evidence}"`).join(" ");
+      paragraphs.push(
+        `Your posting asks for ${asked}. Here's what my own confirmed facts show for those: ${quotes}`
+      );
+    } else if (missing.length > 0) {
+      paragraphs.push(
+        `I'll be straight with you: nothing I've confirmed yet evidences ${list(
+          missing.slice(0, 3).map((entry) => entry.keyword)
+        )}, so I've left those out rather than overstate what I've done.`
+      );
+    }
 
-  if (profile.location) {
-    factsUsed.push(`Location: ${profile.location}`);
-  }
-  if (profile.full_name) factsUsed.push(`Name: ${profile.full_name}`);
+    if (mentionsWorkRights && isAnswered("work_rights")) {
+      useAnswer(fieldAnswer("work_rights"));
+      paragraphs.push(`On work rights: ${valueOf("work_rights")}.`);
+    }
 
-  const paragraphs: string[] = [opening.join(" ")];
+    const links = (["portfolio", "github", "linkedin"] as const)
+      .filter((key) => isAnswered(key))
+      .map((key) => {
+        useAnswer(fieldAnswer(key));
+        return valueOf(key);
+      });
+    if (links.length > 0) {
+      paragraphs.push(`You can see my work and background here: ${list(links)}.`);
+    }
 
-  const topEvidence = evidenced.slice(0, 3);
-  if (topEvidence.length > 0) {
-    const asked = list(topEvidence.map((entry) => entry.keyword));
-    const quotes = topEvidence.map((entry) => `"${entry.evidence}"`).join(" ");
     paragraphs.push(
-      `Your posting asks for ${asked}. Here's what my own background shows for those: ${quotes}`
+      "Thank you for considering my application — I'd welcome the chance to talk through any of the above."
     );
-    factsUsed.push(`Matched requirements: ${asked}`);
-  } else if (missing.length > 0) {
-    paragraphs.push(
-      `I'll be straight with you: my background doesn't yet evidence ${list(
-        missing.slice(0, 3).map((entry) => entry.keyword)
-      )}, so I've left those out rather than overstate what I've done.`
-    );
+
+    const signOffLines: string[] = [];
+    if (isAnswered("full_name")) {
+      useAnswer(fieldAnswer("full_name"));
+      signOffLines.push(valueOf("full_name"));
+    } else {
+      signOffLines.push("[your name — add it on the review screen]");
+    }
+    const contactBits = (["email", "phone", "location"] as const)
+      .filter((key) => isAnswered(key))
+      .map((key) => {
+        useAnswer(fieldAnswer(key));
+        return valueOf(key);
+      });
+    if (contactBits.length > 0) signOffLines.push(contactBits.join(" · "));
+
+    coverLetter = [greeting, ...paragraphs, `Kind regards,\n${signOffLines.join("\n")}`].join("\n\n");
   }
-
-  if (mentionsWorkRights && profile.work_authorisation) {
-    paragraphs.push(
-      `On work rights: ${profile.work_authorisation}${profile.work_authorisation_note ? ` — ${profile.work_authorisation_note}` : ""}.`
-    );
-  }
-
-  const links = [profile.portfolio_url, profile.github_url, profile.linkedin_url].filter(Boolean);
-  if (links.length > 0) {
-    paragraphs.push(`You can see my work and background here: ${list(links)}.`);
-  }
-
-  paragraphs.push(
-    `Thank you for considering my application — I'd welcome the chance to talk through any of the above.`
-  );
-
-  const signOffLines = [profile.full_name || "[your name — add it in your profile]"];
-  const contactBits = [profile.email, profile.phone, profile.location].filter(Boolean).join(" · ");
-  if (contactBits) signOffLines.push(contactBits);
-
-  const coverLetter = [
-    company ? `Dear ${company} hiring team,` : "Dear Hiring Manager,",
-    ...paragraphs,
-    `Kind regards,\n${signOffLines.join("\n")}`,
-  ].join("\n\n");
 
   // -- drafted answers ---------------------------------------------------------
   const answers: KitAnswer[] = [];
+  const topEvidence = evidenced.slice(0, 3);
+  const role = fieldAnswer("current_role");
+  const pushAnswer = (
+    question: string,
+    text: string,
+    basis: KitAnswerBasis,
+    sources: string[]
+  ): void => {
+    answers.push({ question, answer: text, sources, missingInput: basis !== "confirmed", basis });
+  };
 
-  const roleAnswerSources: string[] = [];
-  const roleAnswer: string[] = [];
-  roleAnswer.push(`${roleLabel ? `You're hiring for ${roleLabel}` : "You're hiring"}${atCompany}.`);
-  if (latest) {
-    const asWhat = [latest.title, latest.company].filter(Boolean).join(" at ");
-    const dates = dateRange(latest.start, latest.end);
-    roleAnswer.push(`I'm applying from my current position as ${asWhat}${dates ? ` (${dates})` : ""}.`);
-    roleAnswerSources.push(`Profile experience: ${asWhat}`);
+  // 1. Why do you want this role?
+  const roleAnswer: string[] = [`${roleLabel ? `You're hiring for ${roleLabel}` : "You're hiring"}${atCompany}.`];
+  const roleSources: string[] = [];
+  if (role.status === "answered") {
+    useAnswer(role);
+    roleAnswer.push(`I'm applying from my most recent role: ${role.answer}.`);
+    roleSources.push(...sourcesOf(role));
   }
   if (topEvidence.length > 0) {
     roleAnswer.push(
-      `The parts of the posting that line up with what my profile actually records are ${list(
+      `The parts of the posting that line up with what I've confirmed are ${list(
         topEvidence.map((entry) => entry.keyword)
       )}. For example: ${topEvidence.map((entry) => `"${entry.evidence}"`).join(" ")}`
     );
-    roleAnswerSources.push("Résumé / experience text in your profile");
+    for (const entry of topEvidence) {
+      const owner = evidenceOwner.get(entry.keyword);
+      if (owner) roleSources.push(`${owner.label}: ${owner.value}`);
+    }
   }
   if (missing.length > 0) {
     const missingTop = missing.slice(0, 4).map((entry) => entry.keyword);
     roleAnswer.push(
-      `Two things to be aware of before I send this: your posting also asks for ${list(missingTop)}, and my profile doesn't cover ${
+      `Two things to be aware of before I send this: your posting also asks for ${list(missingTop)}, and nothing I've confirmed covers ${
         missingTop.length > 1 ? "those" : "that"
       } yet. I'd rather flag that than pad the answer.`
     );
   }
-  answers.push({
-    question: "Why do you want this role?",
-    answer: roleAnswer.join(" "),
-    sources: roleAnswerSources.length > 0 ? roleAnswerSources : ["Profile (limited data)"],
-    missingInput: roleAnswerSources.length === 0,
-  });
+  pushAnswer("Why do you want this role?", roleAnswer.join(" "), basisOf(role), roleSources);
 
+  // 2. Tell us about yourself
   const aboutLines: string[] = [];
   const aboutSources: string[] = [];
-  aboutLines.push(profile.full_name ? `I'm ${profile.full_name}.` : "Add your name to your profile and this answer will lead with it.");
-  if (profile.location) aboutLines.push(`Based in ${profile.location}.`);
-  if (latest) {
-    const asWhat = [latest.title, latest.company].filter(Boolean).join(" at ");
-    const dates = dateRange(latest.start, latest.end);
-    aboutLines.push(
-      `${isCurrent(latest.end) ? "I currently work" : "I most recently worked"} as ${asWhat}${dates ? ` (${dates})` : ""}.`
-    );
-    aboutSources.push(`Profile experience: ${asWhat}`);
+  const name = fieldAnswer("full_name");
+  if (name.status === "answered") {
+    useAnswer(name);
+    aboutLines.push(`I'm ${name.answer}.`);
+    aboutSources.push(...sourcesOf(name));
+  } else {
+    aboutLines.push("Add your name on the review screen and this answer will lead with it.");
   }
-  if (education && (education.qualification || education.school)) {
-    aboutLines.push(
-      `Before that: ${[education.qualification, education.school].filter(Boolean).join(" at ")}${
-        education.dates ? ` (${education.dates})` : ""
-      }.`
-    );
-    aboutSources.push("Profile education");
+  const location = fieldAnswer("location");
+  if (location.status === "answered") {
+    useAnswer(location);
+    aboutLines.push(`Based in ${location.answer}.`);
+    aboutSources.push(...sourcesOf(location));
   }
-  if (evidenced.length > 0) {
-    const top = evidenced.slice(0, 5).map((entry) => entry.keyword);
-    aboutLines.push(`The skills my profile records are ${list(top)}.`);
-    aboutSources.push("Profile résumé text / role descriptions");
+  if (role.status === "answered") {
+    aboutLines.push(`My most recent role: ${role.answer}.`);
+    aboutSources.push(...sourcesOf(role));
   }
-  if (profile.resume_text.trim()) {
-    const firstLine = truncate(profile.resume_text.trim(), 240);
-    aboutLines.push(`Straight from my profile: "${firstLine}"`);
-    aboutSources.push("Résumé text you pasted in");
+  if (education.status === "answered") {
+    useAnswer(education);
+    aboutLines.push(`Education: ${education.answer}.`);
+    aboutSources.push(...sourcesOf(education));
   }
-  if (links.length > 0) aboutLines.push(`Links: ${list(links)}.`);
-  answers.push({
-    question: "Tell us about yourself",
-    answer: aboutLines.join(" "),
-    sources: aboutSources,
-    missingInput: aboutSources.length === 0,
-  });
+  const skills = fieldAnswer("skills");
+  if (skills.status === "answered") {
+    useAnswer(skills);
+    aboutLines.push(`The skills my confirmed facts list: ${skills.answer}.`);
+    aboutSources.push(...sourcesOf(skills));
+  }
+  const years = fieldAnswer("years_experience");
+  const yearsSource = years.sources[0];
+  if (years.status === "answered" && yearsSource) {
+    use(yearsSource);
+    aboutLines.push(`My material states my experience as “${yearsSource.factValue}”.`);
+    aboutSources.push(`${yearsSource.factLabel}: ${yearsSource.factValue}`);
+  }
+  const aboutLinks = (["portfolio", "github", "linkedin"] as const).filter((key) => isAnswered(key));
+  if (aboutLinks.length > 0) {
+    const values = aboutLinks.map((key) => {
+      useAnswer(fieldAnswer(key));
+      return valueOf(key);
+    });
+    aboutLines.push(`Links: ${list(values)}.`);
+    for (const key of aboutLinks) aboutSources.push(...sourcesOf(fieldAnswer(key)));
+  }
+  pushAnswer(
+    "Tell us about yourself",
+    aboutLines.join(" "),
+    basisOf(name, location, role, education, skills, years),
+    aboutSources
+  );
 
+  // 3. Greatest strength
   const strength = evidenced.find((entry) => entry.required) ?? evidenced[0] ?? null;
-  answers.push({
-    question: "What's your greatest strength?",
-    answer: strength
-      ? `My strongest match to this posting is ${strength.keyword}. Where that shows up in my own profile: "${strength.evidence}" That's the experience I'd lean on for ${
+  const strengthOwner = strength ? evidenceOwner.get(strength.keyword) : undefined;
+  pushAnswer(
+    "What's your greatest strength?",
+    strength
+      ? `My strongest match to this posting is ${strength.keyword}. Where that shows up in my own confirmed facts: "${strength.evidence}" That's the experience I'd lean on for ${
           roleLabel ? `this ${roleLabel} role` : "this role"
         }.`
-      : "Your profile doesn't yet record a skill that this posting asks for, so there's no strength I can point at honestly. Add more of your résumé text and role detail, then regenerate.",
-    sources: strength ? [`Profile text mentioning ${strength.keyword}`] : [],
-    missingInput: !strength,
-  });
+      : "Nothing you have confirmed records a skill this posting asks for, so there's no strength here I can point at honestly. Confirm the facts we read from your résumé text and roles, then rebuild the kit.",
+    strength ? "confirmed" : basisOf(skills),
+    strengthOwner ? [`${strengthOwner.label}: ${strengthOwner.value}`] : []
+  );
 
-  answers.push({
-    question: "What are your salary expectations?",
-    answer: profile.salary_expectation
-      ? `My expectation is ${profile.salary_expectation}. I'm happy to discuss the range for this role.`
-      : "You haven't saved a salary expectation in your ApplyPilot profile, so there's no honest number to put here. Add one (Profile vault → Salary expectation) and regenerate — or answer this one yourself.",
-    sources: profile.salary_expectation ? ["Profile: salary expectation"] : [],
-    missingInput: !profile.salary_expectation,
+  // 4. Salary expectation — the answers screen's own answer for this field.
+  const salary = fieldAnswer("salary_expectation");
+  const salaryText = draftedFrom(salary, {
+    subject: "a salary expectation",
+    confirmed: (value) => `My expectation is ${value}. I'm happy to discuss the range for this role.`,
+    missing:
+      "You haven't saved a salary expectation in your vault, so there's no honest number to put here. Add one (Profile vault → Salary expectation), confirm it, and rebuild — or answer this one yourself.",
   });
+  pushAnswer(
+    "What are your salary expectations?",
+    salaryText.text,
+    salaryText.basis,
+    salaryText.basis === "confirmed" ? sourcesOf(useAnswer(salary)) : []
+  );
 
-  answers.push({
-    question: "What's your notice period?",
-    answer: profile.notice_period
-      ? `My notice period is ${profile.notice_period}.`
-      : "You haven't saved a notice period in your ApplyPilot profile. Add it (Profile vault → Notice period) and regenerate — or answer this one yourself.",
-    sources: profile.notice_period ? ["Profile: notice period"] : [],
-    missingInput: !profile.notice_period,
+  // 5. Notice period
+  const notice = fieldAnswer("notice_period");
+  const noticeText = draftedFrom(notice, {
+    subject: "a notice period",
+    confirmed: (value) => `My notice period is ${value}.`,
+    missing:
+      "You haven't saved a notice period in your vault. Add it (Profile vault → Notice period), confirm it, and rebuild — or answer this one yourself.",
   });
+  pushAnswer(
+    "What's your notice period?",
+    noticeText.text,
+    noticeText.basis,
+    noticeText.basis === "confirmed" ? sourcesOf(useAnswer(notice)) : []
+  );
 
-  const workAuthAnswer = profile.work_authorisation
-    ? [
-        `My work authorisation status: ${profile.work_authorisation}.`,
-        profile.work_authorisation_note ? `Additional detail from my profile: ${profile.work_authorisation_note}.` : "",
-        mentionsWorkRights ? "Your posting raises work rights or sponsorship, so this is the point to confirm with the hiring team." : "",
-      ]
-        .filter(Boolean)
-        .join(" ")
-    : "Your profile has no work authorisation status saved. Add it (Profile vault → Work authorisation) and regenerate — this is one question you don't want an app guessing at.";
-  answers.push({
-    question: "What's your work authorisation / visa status?",
-    answer: workAuthAnswer,
-    sources: profile.work_authorisation ? ["Profile: work authorisation"] : [],
-    missingInput: !profile.work_authorisation,
+  // 6. Work authorisation
+  const workRights = fieldAnswer("work_rights");
+  const workRightsText = draftedFrom(workRights, {
+    subject: "your work authorisation status",
+    confirmed: (value) =>
+      `My work authorisation status: ${value}.${
+        mentionsWorkRights
+          ? " Your posting raises work rights or sponsorship, so this is the point to confirm with the hiring team."
+          : ""
+      }`,
+    missing:
+      "Your vault has no work authorisation status saved. Add it (Profile vault → Work authorisation), confirm it, and rebuild — this is one question you don't want an app guessing at.",
   });
+  pushAnswer(
+    "What's your work authorisation / visa status?",
+    workRightsText.text,
+    workRightsText.basis,
+    workRightsText.basis === "confirmed" ? sourcesOf(useAnswer(workRights)) : []
+  );
+
+  // -- how much of the kit's basis is actually in place ------------------------
+  // Eleven basics, each one either covered by a fact the user confirmed or not. This
+  // used to be a count over the raw vault, which said nothing about whether the kit
+  // could use any of it.
+  const basics: boolean[] = [
+    isAnswered("full_name"),
+    isAnswered("email"),
+    isAnswered("phone"),
+    isAnswered("location"),
+    confirmedFacts.some((fact) => fact.source.kind === "resume"),
+    isAnswered("current_role"),
+    isAnswered("education"),
+    isAnswered("work_rights"),
+    isAnswered("salary_expectation"),
+    isAnswered("notice_period"),
+    isAnswered("portfolio") || isAnswered("github") || isAnswered("linkedin"),
+  ];
+  const profileCompleteness = Math.round((basics.filter(Boolean).length / basics.length) * 100);
 
   return {
     generatedAt: now.toISOString(),
@@ -1293,7 +1448,14 @@ export function generateKit({ profile, application, now = new Date() }: Generate
     keywordMatch,
     gaps,
     postingQuestions: extractPostingQuestions(posting),
-    profileFactsUsed: factsUsed,
+    profileFactsUsed: used.map(usedLine),
     profileCompleteness,
+    factBasis: {
+      confirmed: confirmedFacts.length,
+      pending: facts.filter((fact) => fact.status === "suggested").length,
+      excluded: facts.filter((fact) => fact.status === "excluded").length,
+      factsInSet: facts.length,
+      nothingConfirmed,
+    },
   };
 }

@@ -103,15 +103,16 @@ function Landing() {
           <ul className="mt-3 space-y-2 text-sm leading-relaxed text-slate-600">
             <li>
               • It never invents experience, dates, employers or credentials. Every sentence is built from
-              the profile you saved, and where a posting asks for something your profile doesn&apos;t cover
-              it says so — “your profile doesn&apos;t mention X” — instead of making something up.
+              the facts you confirmed for yourself, and where a posting asks for something they don&apos;t
+              cover it says so — “nothing you have confirmed mentions X” — instead of making something up.
             </li>
             <li>
               • It never applies to anything. There is no auto-submit and no background sending: you review,
               copy and submit each application yourself.
             </li>
             <li>• It doesn&apos;t have access to your real employer accounts, and it doesn&apos;t guess salary or
-              visa details — you save those once, and it repeats them exactly.</li>
+              visa details — those come through as facts you confirm for yourself, and it uses your own
+              wording.</li>
           </ul>
         </Card>
 

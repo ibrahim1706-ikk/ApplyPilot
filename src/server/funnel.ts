@@ -35,11 +35,18 @@ import type { FunnelEventName } from "~/db";
 
 /**
  * Résumé text at or below this length is not something an application can be
- * built from — the kit would have nothing of the user's own to quote. The number
- * matches the kit generator's own "profile completeness" rule in
- * `src/server/generate.ts` (`profile.resume_text.trim().length > 40`), so this
- * step means the same thing the kit's completeness check means; the check script
- * fails if the two ever drift apart.
+ * built from — it is too short to quote anything of the user's own.
+ *
+ * This is the FUNNEL's own vault threshold, and it is the only résumé-length rule
+ * left in the product. It used to be shared with the kit generator's "profile
+ * completeness" test, and the check script required the two to stay in step. The kit
+ * no longer measures the vault by text length at all: it is built from the facts the
+ * user CONFIRMED, so what it measures is confirmation, not characters
+ * (`scripts/kit-provenance-check.ts` pins that, including a source scan that fails if
+ * a raw vault read comes back). This step is recorded when the vault is saved —
+ * before any fact has been read or confirmed — so a vault measure is still the honest
+ * thing to record here, and the invariant worth keeping is that the number lives in
+ * exactly one place.
  */
 export const RESUME_TEXT_MIN_CHARS = 40;
 
