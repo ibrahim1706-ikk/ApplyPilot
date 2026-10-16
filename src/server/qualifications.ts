@@ -34,9 +34,12 @@ import {
   FACT_CATEGORY_COPY,
   FACT_CATEGORY_ORDER,
   FACT_FIELDS,
+  IDENTITY_FACT_LABELS,
   deriveFactValue,
   emptyFactConfirmations,
   factValueKey,
+  identityFactField,
+  identityFactLabel,
 } from "~/types";
 import type {
   ExtractionReport,
@@ -891,26 +894,28 @@ function identityDrafts(input: QualificationInput, doc: ParsedDocument): FactDra
     );
   };
 
-  field("Name", "full_name", input.fullName);
-  field("Email", "email", input.email);
-  field("Phone", "phone", input.phone);
-  field("Location", "location", input.location);
-  field("Portfolio", "portfolio_url", input.portfolioUrl);
-  field("GitHub", "github_url", input.githubUrl);
-  field("LinkedIn", "linkedin_url", input.linkedinUrl);
+  // The labels come from the one map the answers engine also matches on, so a
+  // vault fact and the field it answers cannot drift apart.
+  field(IDENTITY_FACT_LABELS.full_name, "full_name", input.fullName);
+  field(IDENTITY_FACT_LABELS.email, "email", input.email);
+  field(IDENTITY_FACT_LABELS.phone, "phone", input.phone);
+  field(IDENTITY_FACT_LABELS.location, "location", input.location);
+  field(IDENTITY_FACT_LABELS.portfolio, "portfolio_url", input.portfolioUrl);
+  field(IDENTITY_FACT_LABELS.github, "github_url", input.githubUrl);
+  field(IDENTITY_FACT_LABELS.linkedin, "linkedin_url", input.linkedinUrl);
   // Notice period and salary expectation are vault answers to questions a real
   // application form asks. They come through this pipeline like everything else
   // so the user can check, correct and CONFIRM them — stage 3 will only ever
   // answer a form from confirmed facts, and these are two of the fields it
   // answers. Whatever the user typed is quoted as it stands; nothing is added.
   field(
-    "Notice period",
+    IDENTITY_FACT_LABELS.notice_period,
     "notice_period",
     input.noticePeriod,
     "Saved in the vault's Application basics card, in your own words. We never assume a notice period from a role's dates."
   );
   field(
-    "Salary expectation",
+    IDENTITY_FACT_LABELS.salary_expectation,
     "salary_expectation",
     input.salaryExpectation,
     "Saved in the vault's Application basics card, in your own words. No range or market rate is ever suggested here."
@@ -918,15 +923,15 @@ function identityDrafts(input: QualificationInput, doc: ParsedDocument): FactDra
 
   const have = (label: string): boolean => out.some((item) => item.label === label);
 
-  if (!have("Email") || !have("Phone")) {
+  if (!have(IDENTITY_FACT_LABELS.email) || !have(IDENTITY_FACT_LABELS.phone)) {
     for (const line of lines) {
-      const email = !have("Email") ? EMAIL_RE.exec(line.raw)?.[0] ?? "" : "";
-      const phone = !have("Phone") ? findPhone(line.raw) : "";
+      const email = !have(IDENTITY_FACT_LABELS.email) ? EMAIL_RE.exec(line.raw)?.[0] ?? "" : "";
+      const phone = !have(IDENTITY_FACT_LABELS.phone) ? findPhone(line.raw) : "";
       if (email) {
         out.push(
           draft(
             "identity",
-            "Email",
+            IDENTITY_FACT_LABELS.email,
             { value: email },
             lineSource(line),
             line.raw,
@@ -938,7 +943,7 @@ function identityDrafts(input: QualificationInput, doc: ParsedDocument): FactDra
         out.push(
           draft(
             "identity",
-            "Phone",
+            IDENTITY_FACT_LABELS.phone,
             { value: phone },
             lineSource(line),
             line.raw,
@@ -949,13 +954,13 @@ function identityDrafts(input: QualificationInput, doc: ParsedDocument): FactDra
     }
   }
 
-  if (!have("Name")) {
+  if (!have(IDENTITY_FACT_LABELS.full_name)) {
     const nameLine = findName(lines);
     if (nameLine) {
       out.push(
         draft(
           "identity",
-          "Name",
+          IDENTITY_FACT_LABELS.full_name,
           { value: nameLine.text },
           lineSource(nameLine),
           nameLine.raw,
@@ -965,7 +970,11 @@ function identityDrafts(input: QualificationInput, doc: ParsedDocument): FactDra
     }
   }
 
-  if (!have("GitHub") || !have("LinkedIn") || !have("Portfolio")) {
+  if (
+    !have(IDENTITY_FACT_LABELS.github) ||
+    !have(IDENTITY_FACT_LABELS.linkedin) ||
+    !have(IDENTITY_FACT_LABELS.portfolio)
+  ) {
     for (const line of lines) {
       BARE_URL_ALL_RE.lastIndex = 0;
       const bare = line.raw.match(BARE_URL_ALL_RE) ?? [];
@@ -973,13 +982,13 @@ function identityDrafts(input: QualificationInput, doc: ParsedDocument): FactDra
       for (const url of urls.filter(Boolean)) {
         const lower = url.toLowerCase();
         const label = lower.includes("github")
-          ? "GitHub"
+          ? IDENTITY_FACT_LABELS.github
           : lower.includes("linkedin")
-            ? "LinkedIn"
-            : "Portfolio";
+            ? IDENTITY_FACT_LABELS.linkedin
+            : IDENTITY_FACT_LABELS.portfolio;
         if (have(label)) continue;
-        if (label !== "Portfolio" && !lower.includes("github") && !lower.includes("linkedin")) continue;
-        if (label === "Portfolio" && (lower.includes("github") || lower.includes("linkedin"))) continue;
+        if (label !== IDENTITY_FACT_LABELS.portfolio && !lower.includes("github") && !lower.includes("linkedin")) continue;
+        if (label === IDENTITY_FACT_LABELS.portfolio && (lower.includes("github") || lower.includes("linkedin"))) continue;
         out.push(
           draft(
             "identity",
@@ -994,7 +1003,7 @@ function identityDrafts(input: QualificationInput, doc: ParsedDocument): FactDra
     }
   }
 
-  if (!have("Location")) {
+  if (!have(IDENTITY_FACT_LABELS.location)) {
     // Deliberately not attempted: a city line cannot be told from an employer's
     // location or a conference name, and a wrong location is worse than none.
     if (wholeText.trim()) {
@@ -1969,7 +1978,15 @@ function applyOne(fact: Fact, decision: FactDecision | undefined, tombstoned: bo
   return { ...fact, status: "suggested" };
 }
 
-/** What a fact the user added themselves is called in the list. */
+/**
+ * What a fact the user added themselves is called in the list, when they did not
+ * say which application field it was for.
+ *
+ * `identity` is the one that matters: the identity-backed answers are matched by
+ * label, so an identity detail added under this generic label is a detail the
+ * answers engine cannot use — which is why `addFact` accepts the field it was
+ * added for (see `addFact`) and why this stays the fallback, not the only option.
+ */
 const ADDED_LABELS: Record<FactCategory, string> = {
   identity: "Detail you added",
   role: "Role you added",
@@ -1987,7 +2004,11 @@ function addedFact(decision: FactDecision): Fact {
   return {
     id: decision.id,
     category: decision.category,
-    label: ADDED_LABELS[decision.category],
+    // The label the user added it for, when they named one — so "add my email"
+    // produces a fact the email field answers from instead of a generic detail
+    // that matches no rule. Still `source: { kind: "user" }`, so it reads as
+    // theirs and is never quoted back as something we read.
+    label: decision.label ?? ADDED_LABELS[decision.category],
     value: deriveFactValue(decision.category, fields, decision.value ?? ""),
     fields,
     source: { kind: "user" },
@@ -2385,43 +2406,70 @@ export function restoreFact(userId: string, id: string): Outcome {
  * ADD a fact the extractor did not find. It is stored as the user's own — the
  * review screen labels it "you added this" and never quotes the résumé for it,
  * because it did not come from there.
+ *
+ * `rawForField` (optional) names the application field the detail was added FOR
+ * — `"email"`, `"notice_period"`, … — and only identity facts accept one. This is
+ * not a nicety: the identity-backed answers match their facts by LABEL, so
+ * without it a detail added for one of the nine identity-backed fields was stored
+ * under the generic "Detail you added" and answered nothing, silently, on the
+ * screen whose promise is that adding the missing detail is what fills the field.
+ * A value that is not one of the nine is refused rather than stored under a name
+ * no rule reads.
  */
 export function addFact(
   userId: string,
   category: FactCategory,
   rawFields: unknown,
-  rawNote: unknown
+  rawNote: unknown,
+  rawForField?: unknown
 ): Outcome & { id?: string } {
   const state = ensureFacts(userId);
   const fields = readFields(category, rawFields);
   if (missingRequired(category, fields)) {
     return { ok: false, error: "Fill in the value before adding it." };
   }
+  const asked = rawForField === undefined || rawForField === null || rawForField === "" ? null : rawForField;
+  const forField = asked === null ? null : identityFactField(asked);
+  if (asked !== null && (forField === null || category !== "identity")) {
+    return {
+      ok: false,
+      error: "We didn't recognise which detail this is — reload the page and try again.",
+    };
+  }
+  const label = forField ? identityFactLabel(forField) : ADDED_LABELS[category];
   const value = deriveFactValue(category, fields);
   // The same fact added twice is still one fact. Refusing the second copy is
   // what keeps the list honest: without it a second press of "Add it" leaves two
   // identical rows, and the page then shows the user a fact they added once as
   // if they had added it twice. Nothing is inferred by refusing — the fact they
   // already have is theirs and stays where it is.
+  // Keyed by value alone (not by label), because that is how the list itself
+  // de-duplicates: a second copy of the same text would be dropped from the
+  // listing, so allowing it here would be the same silent no-op this change is
+  // undoing.
   const valueKey = factValueKey(category, value);
-  if (state.decisions.some((decision) => decision.action === "add" && decision.valueKey === valueKey)) {
+  const already = state.decisions.find(
+    (decision) => decision.action === "add" && decision.valueKey === valueKey
+  );
+  if (already) {
     return {
       ok: false,
       error:
         `“${value}” is already in your list — you added it yourself, and it is listed as yours. ` +
-        "Correct it there instead of adding it again.",
+        `Correct it there instead of adding it again.`,
     };
   }
   const userNote = typeof rawNote === "string" ? rawNote.trim().slice(0, NOTE_MAX) : "";
   const at = nowIso();
   const decision: FactDecision = {
-    // Deterministic id: same category, value and moment ⇒ same id.
-    id: `user-${category}-${shortHash(`${category}|${value}|${at}`)}`,
+    // Deterministic id: same category, value, field and moment ⇒ same id.
+    id: `user-${category}-${shortHash(`${category}|${forField ?? ""}|${value}|${at}`)}`,
     category,
     action: "add",
     fields,
     value,
     userNote: userNote || undefined,
+    label: forField ? label : undefined,
     valueKey,
     at,
   };

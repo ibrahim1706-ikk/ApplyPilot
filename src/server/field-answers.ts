@@ -32,6 +32,7 @@ import * as qualifications from "~/server/qualifications";
 import {
   ANSWER_FIELD_SPECS,
   FACT_CATEGORY_ORDER,
+  IDENTITY_FACT_LABELS,
   WORK_AUTHORISATION_OPTIONS,
   factSourceCaption,
 } from "~/types";
@@ -57,6 +58,9 @@ export function answerSource(fact: Fact): AnswerSource {
   return {
     factId: fact.id,
     category: fact.category,
+    // Copied, not derived, so the screen can tell a fact the user typed from one
+    // we read and render it accordingly — `quote` alone cannot carry that.
+    sourceKind: fact.source.kind,
     factLabel: fact.label,
     factValue: fact.value,
     fields: { ...fact.fields },
@@ -268,10 +272,21 @@ const SPONSORSHIP_FROM_ANSWER: Record<string, { answer: string; caveat: string }
   },
 };
 
-/** The answers that genuinely do not settle the sponsorship question. */
+/**
+ * The answers that genuinely do not settle the sponsorship question.
+ *
+ * The first wording used to end "…put your wording in the vault's
+ * work-authorisation note and it can be used next time". That was not true of
+ * this layer: the sponsorship branch reads the work-rights answer's VALUE only,
+ * and the note is read by the kit's drafting surface (`generate.ts`), never here.
+ * The promise is removed rather than the note wired in — reading it would be a
+ * field-specific wording, which this milestone deliberately does not build — and
+ * the nudge for it now points at the work-rights answer, which is the one place a
+ * choice that settles this question actually lives.
+ */
 const SPONSORSHIP_NOT_SETTLED: Record<string, string> = {
   [WORK_AUTHORISATION_OPTIONS[2]]:
-    "Your confirmed work-rights answer says you have a visa with limited work rights. That doesn't say whether you would need sponsorship later, so this field is left for you to answer — put your wording in the vault's work-authorisation note and it can be used next time.",
+    "Your confirmed work-rights answer says you have a visa with limited work rights. That doesn't say whether you would need sponsorship later, so this field is left for you to answer. We read the work-rights answer you chose and nothing beside it — the note in your vault's work-authorisation card is not read here — so nothing is inferred from it.",
   [WORK_AUTHORISATION_OPTIONS[4]]:
     "Your confirmed work-rights answer is “Prefer not to say / not sure”, so there is nothing here to answer this question with. An application form is not a place to guess on your behalf.",
 };
@@ -296,44 +311,44 @@ function firstValue(facts: Fact[]): string {
 
 const RULES: Record<AnswerFieldKey, Rule> = {
   full_name: {
-    candidates: (facts) => byLabel(facts, ["Name"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.full_name]),
     build: firstValue,
     notCovered: "Your material doesn't state your name in any form we can quote.",
     nudge: PROFILE_NUDGES.name!,
   },
   email: {
-    candidates: (facts) => byLabel(facts, ["Email"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.email]),
     build: firstValue,
     notCovered: "Nothing you have confirmed gives an email address, and we never guess one from your name.",
     nudge: PROFILE_NUDGES.email!,
   },
   phone: {
-    candidates: (facts) => byLabel(facts, ["Phone"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.phone]),
     build: firstValue,
     notCovered: "Nothing you have confirmed gives a phone number.",
     nudge: PROFILE_NUDGES.phone!,
   },
   location: {
-    candidates: (facts) => byLabel(facts, ["Location"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.location]),
     build: firstValue,
     notCovered:
       "Nothing you have confirmed says where you are based. We only use the Location field in your vault for this — a city line in a résumé is too easy to mistake for an employer's address.",
     nudge: PROFILE_NUDGES.location!,
   },
   portfolio: {
-    candidates: (facts) => byLabel(facts, ["Portfolio"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.portfolio]),
     build: firstValue,
     notCovered: "You have no portfolio or personal site confirmed, so this field stays empty rather than pointing somewhere you didn't name.",
     nudge: PROFILE_NUDGES.links!,
   },
   github: {
-    candidates: (facts) => byLabel(facts, ["GitHub"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.github]),
     build: firstValue,
     notCovered: "You have no GitHub link confirmed, so this field stays empty rather than pointing somewhere you didn't name.",
     nudge: PROFILE_NUDGES.links!,
   },
   linkedin: {
-    candidates: (facts) => byLabel(facts, ["LinkedIn"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.linkedin]),
     build: firstValue,
     notCovered: "You have no LinkedIn link confirmed, so this field stays empty rather than pointing somewhere you didn't name.",
     nudge: PROFILE_NUDGES.links!,
@@ -362,13 +377,13 @@ const RULES: Record<AnswerFieldKey, Rule> = {
     nudge: PROFILE_NUDGES.sponsorship!,
   },
   notice_period: {
-    candidates: (facts) => byLabel(facts, ["Notice period"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.notice_period]),
     build: firstValue,
     notCovered: "Nothing you have confirmed states a notice period, and we never assume one from a role's dates.",
     nudge: PROFILE_NUDGES.notice_period!,
   },
   salary_expectation: {
-    candidates: (facts) => byLabel(facts, ["Salary expectation"]),
+    candidates: (facts) => byLabel(facts, [IDENTITY_FACT_LABELS.salary_expectation]),
     build: firstValue,
     notCovered:
       "Nothing you have confirmed states a salary expectation. We never suggest a range, a market rate or “negotiable” — the number would be ours, not yours.",
@@ -490,8 +505,10 @@ export function fieldAnswersFromFacts(facts: Fact[]): FieldAnswers {
       } else {
         if (unsettled) {
           notCovered = unsettled;
-          // The note field is where the user's own wording for this belongs.
-          nudge = { ...PROFILE_NUDGES.sponsorship!, hash: "work-authorisation-note" };
+          // The nudge stays on the work-rights answer itself: it is the only
+          // place in the vault that can settle this question. It used to point at
+          // the work-authorisation NOTE, which this layer never reads.
+          nudge = PROFILE_NUDGES.sponsorship!;
         } else if (confirmed.length > 0) {
           notCovered =
             `Your confirmed work-rights statement reads “${firstValue(confirmed)}”. That is your own wording, and it doesn't plainly settle whether you would need sponsorship, so this field is left for you to answer.`;

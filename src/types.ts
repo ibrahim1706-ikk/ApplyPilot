@@ -486,6 +486,14 @@ export type FactDecision = {
   value?: string;
   /** Optional note the user typed for a fact they added. */
   userNote?: string;
+  /**
+   * The label a fact the user ADDED is listed under, when they added it for a
+   * specific application field ("Email", "Notice period", …) rather than as a
+   * generic detail. Absent on every decision made before this existed, and on
+   * facts added without naming a field, which keeps the category's generic
+   * "… you added" label.
+   */
+  label?: string;
   /** How the fact read when the decision was taken (absent for "add"). */
   snapshot?: FactSnapshot;
   /**
@@ -700,7 +708,52 @@ export const ANSWER_FIELD_SPECS: Array<{
   { key: "certifications", group: "qualifications", question: "Certifications and licences", hint: "Only the ones your material states." },
   { key: "languages", group: "qualifications", question: "Languages", hint: "With the level your material gives, if it gives one." },
 ];
-
+/**
+ * The label an *identity* fact carries for each application field that is
+ * answered from one.
+ *
+ * Two things read this one map, which is the point: the extractor, when it turns
+ * a vault field or a résumé line into a fact, and the answers engine, when it
+ * decides which fact answers which field. They used to spell the labels out
+ * separately ("Name", "Email", … in one file; `byLabel(facts, ["Email"])` in the
+ * other), and a fact the user added for one of these fields was labelled with the
+ * generic "Detail you added", which no rule matches — so the user's own detail was
+ * stored and then answered nothing. One shared map means a label and the rule that
+ * matches it cannot drift apart again.
+ *
+ * Deliberately not all seventeen fields: work rights, sponsorship, the most
+ * recent role and the list fields are matched by category, where a label plays no
+ * part in whether a fact is used.
+ */
+export const IDENTITY_FACT_LABELS = {
+  full_name: "Name",
+  email: "Email",
+  phone: "Phone",
+  location: "Location",
+  portfolio: "Portfolio",
+  github: "GitHub",
+  linkedin: "LinkedIn",
+  notice_period: "Notice period",
+  salary_expectation: "Salary expectation",
+} as const satisfies Partial<Record<AnswerFieldKey, string>>;
+/** The application fields an identity fact can be added *for*, by name. */
+export type IdentityFactField = keyof typeof IDENTITY_FACT_LABELS;
+/**
+ * Reads a caller's "which field is this detail for?" value. Anything that is not
+ * one of the nine is refused rather than stored: an unrecognised label would be a
+ * second, silently useless name for the fact, which is the bug this closes.
+ */
+export function identityFactField(raw: unknown): IdentityFactField | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return Object.prototype.hasOwnProperty.call(IDENTITY_FACT_LABELS, trimmed)
+    ? (trimmed as IdentityFactField)
+    : null;
+}
+/** The label a fact added for this field is listed under. */
+export function identityFactLabel(field: IdentityFactField): string {
+  return IDENTITY_FACT_LABELS[field];
+}
 /** Which group a field belongs to, for grouping the answers on the screen. */
 export function answerGroupOf(field: AnswerFieldKey): AnswerGroup {
   return ANSWER_FIELD_SPECS.find((spec) => spec.key === field)?.group ?? "identity";
@@ -721,6 +774,18 @@ export type AnswerSource = {
   /** The fact's id — the same id the review screen lists it under. */
   factId: string;
   category: FactCategory;
+  /**
+   * Where the fact came from at the level the screen needs to render it: a vault
+   * field, a line of résumé text, or the user's own typing.
+   *
+   * This is not decoration. The answers screen's promise is that a fact the user
+   * typed is never presented as something we read out of their material — and
+   * `quote` alone cannot carry that, because for a fact the user typed `quote` is
+   * the text they typed, which rendered in the same blockquote as a résumé line
+   * reads as a line we found. The review screen already distinguishes the two; the
+   * answers screen needs the kind to do the same.
+   */
+  sourceKind: FactSource["kind"];
   /** The fact's own short label, e.g. "Email", "Skill", "Role". */
   factLabel: string;
   /** The fact's display text, exactly as it stands (the user's wording if edited). */
